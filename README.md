@@ -82,3 +82,4 @@ Auth: `t`/`s` token, `p` plaintext, `p=enc:<hex>` all accepted.
 - `pkg/debrid/` — AllDebrid v4 client (context timeouts) + Prowlarr search
 - `pkg/metadata/` — Deezer/MusicBrainz → canonical `Song`
 - `pkg/subsonic/` — auth, XML/JSON responses, handlers, router
+
