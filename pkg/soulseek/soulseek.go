@@ -208,10 +208,16 @@ func (c *Client) search(ctx context.Context, query string, limit int) ([]Candida
 	return out, nil
 }
 
-// score ranks candidates for a track: title in filename required,
-// album containment and lossless format rank, free slots and speed break ties.
+// score ranks candidates for a track: the core title (edition tags like
+// "(Studio Recording ...)" stripped — peers never include those in
+// filenames) in filename required, album containment and lossless format
+// rank, free slots and speed break ties.
 func score(cands []Candidate, album, title string) []Candidate {
-	wantT, wantB := norm(title), norm(album)
+	titleCore := stripBrackets(title)
+	if titleCore == "" {
+		titleCore = title // degenerate title made only of brackets
+	}
+	wantT, wantB := norm(titleCore), norm(stripBrackets(album))
 	type scored struct {
 		c Candidate
 		s int
@@ -494,5 +500,27 @@ func norm(s string) string {
 	s = strings.ToLower(s)
 	r := strings.NewReplacer("_", " ", ".", " ", "-", " ", "(", " ", ")", " ", "[", " ", "]", " ")
 	s = r.Replace(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// stripBrackets removes (...) and [...] groups (edition tags, live notes)
+// that metadata carries but filenames and index torrents omit.
+func stripBrackets(s string) string {
+	for {
+		start := strings.IndexAny(s, "([")
+		if start == -1 {
+			break
+		}
+		closer := ")"
+		if s[start] == '[' {
+			closer = "]"
+		}
+		rest := s[start+1:]
+		end := strings.Index(rest, closer)
+		if end == -1 {
+			break
+		}
+		s = s[:start] + " " + rest[end+1:]
+	}
 	return strings.Join(strings.Fields(s), " ")
 }

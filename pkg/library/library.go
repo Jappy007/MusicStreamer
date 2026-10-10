@@ -79,15 +79,20 @@ func (l *Library) Scan() error {
 	return nil
 }
 
-// Lookup returns the best local file for a track. The title must appear in
-// the path (Lidarr names files "01 - Title.ext"); artist/album containment
+// Lookup returns the best local file for a track. The core title
+// (edition tags stripped — Lidarr names files "01 - Title.ext", never
+// with parentheticals) must appear in the path; artist/album containment
 // and lossless format rank competing matches.
 func (l *Library) Lookup(artist, album, title string) (string, bool) {
-	wantT := norm(title)
+	titleCore := stripBrackets(title)
+	if titleCore == "" {
+		titleCore = title
+	}
+	wantT := norm(titleCore)
 	if wantT == "" {
 		return "", false
 	}
-	wantA, wantB := norm(artist), norm(album)
+	wantA, wantB := norm(artist), norm(stripBrackets(album))
 
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -132,5 +137,27 @@ func norm(s string) string {
 	s = strings.ToLower(s)
 	r := strings.NewReplacer("_", " ", ".", " ", "-", " ", "(", " ", ")", " ", "[", " ", "]", " ")
 	s = r.Replace(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// stripBrackets removes (...) and [...] groups (edition tags, live notes)
+// that metadata carries but filenames omit.
+func stripBrackets(s string) string {
+	for {
+		start := strings.IndexAny(s, "([")
+		if start == -1 {
+			break
+		}
+		closer := ")"
+		if s[start] == '[' {
+			closer = "]"
+		}
+		rest := s[start+1:]
+		end := strings.Index(rest, closer)
+		if end == -1 {
+			break
+		}
+		s = s[:start] + " " + rest[end+1:]
+	}
 	return strings.Join(strings.Fields(s), " ")
 }
