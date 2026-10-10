@@ -595,7 +595,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	// for audio). Needs slskd configured (SLSKD_URL/SLSKD_DOWNLOAD_DIR).
 	// Failure falls through to the debrid scrape below.
 	if s.soulseek != nil && s.soulseek.Enabled() {
-		if path, err := s.soulseek.FetchTrack(ctx, artist, album, title); err != nil {
+		if path, err := s.soulseek.FetchTrackShared(ctx, artist, album, title); err != nil {
 			log.Printf("stream: %q - %q: soulseek failed (%v), trying debrid scrape", artist, title, err)
 		} else {
 			log.Printf("stream: %q - %q: tier=soulseek", artist, title)

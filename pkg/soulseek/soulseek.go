@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,6 +54,19 @@ type Client struct {
 	apiKey  string
 	dlDir   string
 	http    *http.Client
+
+	// flying coalesces concurrent fetches for the same track (Feishin
+	// retries every few seconds while waiting): one leader searches and
+	// downloads, followers wait on its result and play the same file the
+	// moment it completes — never a duplicate or a different pick.
+	fmu    sync.Mutex
+	flying map[string]*inflight
+}
+
+type inflight struct {
+	done chan struct{}
+	path string
+	err  error
 }
 
 // New builds a client. An empty downloadDir falls back to
@@ -69,6 +83,7 @@ func New(baseURL, apiKey, downloadDir string, httpClient *http.Client) *Client {
 		apiKey:  apiKey,
 		dlDir:   downloadDir,
 		http:    httpClient,
+		flying:  make(map[string]*inflight),
 	}
 }
 
@@ -312,6 +327,38 @@ func terminalBad(state string) bool {
 	return false
 }
 
+// FetchTrackShared is the coalesced entry point handlers call. Concurrent
+// requests for the same track collapse onto one leader: the leader runs
+// FetchTrack detached from any single client connection (so one retry
+// timing out can't kill everyone else's wait), followers block until it
+// completes and then play the very same file. Late arrivals redo the
+// lookup, which converges instantly on the completed download.
+func (c *Client) FetchTrackShared(ctx context.Context, artist, album, title string) (string, error) {
+	key := artist + "\x00" + album + "\x00" + title
+	c.fmu.Lock()
+	if f, ok := c.flying[key]; ok {
+		c.fmu.Unlock()
+		log.Printf("soulseek: %q - %q: joining in-flight fetch", artist, title)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-f.done:
+			return f.path, f.err
+		}
+	}
+	f := &inflight{done: make(chan struct{})}
+	c.flying[key] = f
+	c.fmu.Unlock()
+
+	log.Printf("soulseek: %q - %q: leading fetch", artist, title)
+	f.path, f.err = c.FetchTrack(context.WithoutCancel(ctx), artist, album, title)
+	close(f.done)
+	c.fmu.Lock()
+	delete(c.flying, key)
+	c.fmu.Unlock()
+	return f.path, f.err
+}
+
 // FetchTrack searches Soulseek for a track, downloads the best match via
 // slskd, and returns the local path of the completed file. Repeat calls
 // converge: an already-completed download is served without re-queueing.
@@ -368,20 +415,34 @@ func (c *Client) FetchTrack(ctx context.Context, artist, album, title string) (s
 }
 
 // fetchOne ensures one candidate is downloaded and resolves its local path.
+// A completed earlier attempt serves instantly; a still-running one is
+// waited on, never re-enqueued (re-queueing the same file just duplicates
+// queue entries, and concurrent retries must not each pick anew).
 func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
-	// Idempotency first: a completed earlier attempt serves instantly.
+	needEnqueue := true
 	if files, err := c.listDownloads(ctx, cd.Username); err == nil {
 		for _, f := range files {
-			if sameTrack(f.Filename, cd.Filename) && terminalOK(f.State) {
+			if !sameTrack(f.Filename, cd.Filename) {
+				continue
+			}
+			switch {
+			case terminalOK(f.State):
 				if p, ok := c.resolve(cd.Filename); ok {
 					return p, nil
 				}
+			case terminalBad(f.State):
+				// Stale failure: fall through and try enqueueing again.
+			default:
+				log.Printf("soulseek: %s already %s, waiting on it", cd.Filename, f.State)
+				needEnqueue = false
 			}
 		}
 	}
-	if err := c.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+cd.Username,
-		[]map[string]any{{"filename": cd.Filename, "size": cd.Size}}, nil); err != nil {
-		return "", err
+	if needEnqueue {
+		if err := c.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+cd.Username,
+			[]map[string]any{{"filename": cd.Filename, "size": cd.Size}}, nil); err != nil {
+			return "", err
+		}
 	}
 	t := time.NewTicker(xferPollEvery)
 	defer t.Stop()
