@@ -109,9 +109,14 @@ func main() {
 	public := debrid.NewPublicIndex(nil)
 	sk := soulseek.New(cfg.SlskdURL, cfg.SlskdAPIKey, cfg.SlskdDownloadDir, nil)
 	if sk.Enabled() {
-		log.Printf("soulseek: enabled (%s -> %s)", cfg.SlskdURL, cfg.SlskdDownloadDir)
+		if fi, err := os.Stat(sk.DownloadDir()); err != nil || !fi.IsDir() {
+			log.Printf("soulseek: WARNING download dir %s not visible — mount slskd's downloads volume there (SLSKD_DOWNLOAD_DIR overrides the %s default)",
+				sk.DownloadDir(), soulseek.DefaultDownloadDir)
+		} else {
+			log.Printf("soulseek: enabled (%s -> %s)", cfg.SlskdURL, sk.DownloadDir())
+		}
 	} else {
-		log.Println("soulseek: disabled; set SLSKD_URL + SLSKD_DOWNLOAD_DIR to enable")
+		log.Println("soulseek: disabled; set SLSKD_URL to enable")
 	}
 	// Index download links are served by Prowlarr itself (LAN-only,
 	// key-gated): fetch them here so AllDebrid receives real .torrent bytes.

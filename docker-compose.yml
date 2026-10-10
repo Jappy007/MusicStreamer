@@ -20,7 +20,7 @@ services:
     ports:
       - "${PORT:-4533}:4533"
     environment:
-      ALLDEBRID_API_KEY: ${ALLDEBRID_API_KEY:?set your AllDebrid API key in .env}
+      ALLDEBRID_API_KEY: "${ALLDEBRID_API_KEY:?set your AllDebrid API key in .env}"
       SUBSONIC_USER: ${SUBSONIC_USER:-admin}
       SUBSONIC_PASS: ${SUBSONIC_PASS:-admin}
       CACHE_SIZE_GB: ${CACHE_SIZE_GB:-10}
@@ -29,15 +29,17 @@ services:
       PROWLARR_API_KEY: ${PROWLARR_API_KEY:-}
       MIN_SEEDERS: ${MIN_SEEDERS:-0}
       MUSIC_DIR: ${MUSIC_DIR:-}
-      # In-container slskd address (service name) and shared downloads volume.
-      # Override in .env only if slskd runs outside this stack.
+      # Soulseek: slskd's address (service name) and downloads. The downloads
+      # volume is mounted at slskd's own container default (/app/downloads),
+      # so leave SLSKD_DOWNLOAD_DIR empty unless slskd uses a custom dir
+      # (or runs outside this stack — then mount its folder and set the var).
       SLSKD_URL: ${SLSKD_URL:-http://slskd:5030}
       SLSKD_API_KEY: ${SLSKD_API_KEY:-}
-      SLSKD_DOWNLOAD_DIR: ${SLSKD_DOWNLOAD_DIR:-/slskd-downloads}
+      SLSKD_DOWNLOAD_DIR: ${SLSKD_DOWNLOAD_DIR:-}
       PORT: "4533"
     volumes:
       - cache:/data/cache
-      - slskd-downloads:/slskd-downloads:ro
+      - slskd-downloads:/app/downloads:ro
       # Optional Tier 0: Lidarr's output, played instantly from disk.
       # Uncomment and set MUSIC_DIR=/music in .env:
       # - /path/to/music:/music:ro

@@ -33,9 +33,21 @@ const (
 	downloadTimeout = 10 * time.Minute
 )
 
+// DefaultDownloadDir is slskd's own container default for completed
+// downloads (/app/downloads in the official image). It is assumed when
+// SLSKD_DOWNLOAD_DIR is unset, so the compose stack works with zero path
+// config as long as the downloads volume is mounted there (see
+// docker-compose.yml). A custom slskd downloads dir still needs the env var.
+const DefaultDownloadDir = "/app/downloads"
+
 // Client drives a self-hosted slskd instance (https://slskd.org) over its
 // /api/v0 REST API: search the Soulseek network, queue the best match,
 // wait for completion, resolve the local file.
+//
+// slskd exposes listing/deletion of its download dir over the API but no
+// file *content* endpoint, so completed files are served from a shared
+// filesystem (same host bind mount or shared volume). Point
+// SLSKD_DOWNLOAD_DIR at slskd's downloads folder as seen locally.
 type Client struct {
 	baseURL string
 	apiKey  string
@@ -43,10 +55,14 @@ type Client struct {
 	http    *http.Client
 }
 
-// New builds a client. Empty baseURL or dlDir disables it (see Enabled).
+// New builds a client. An empty downloadDir falls back to
+// DefaultDownloadDir.
 func New(baseURL, apiKey, downloadDir string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	if strings.TrimSpace(downloadDir) == "" {
+		downloadDir = DefaultDownloadDir
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -57,7 +73,15 @@ func New(baseURL, apiKey, downloadDir string, httpClient *http.Client) *Client {
 }
 
 // Enabled reports whether Soulseek fetching is configured.
-func (c *Client) Enabled() bool { return c != nil && c.baseURL != "" && c.dlDir != "" }
+func (c *Client) Enabled() bool { return c != nil && c.baseURL != "" }
+
+// DownloadDir returns the resolved local download directory.
+func (c *Client) DownloadDir() string {
+	if c == nil {
+		return ""
+	}
+	return c.dlDir
+}
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
 	var rdr io.Reader
@@ -285,7 +309,14 @@ func terminalBad(state string) bool {
 // FetchTrack searches Soulseek for a track, downloads the best match via
 // slskd, and returns the local path of the completed file. Repeat calls
 // converge: an already-completed download is served without re-queueing.
+// The download dir must be visible locally (shared volume/bind mount);
+// otherwise this fails fast instead of waiting out a download whose bytes
+// could never be served.
 func (c *Client) FetchTrack(ctx context.Context, artist, album, title string) (string, error) {
+	if fi, err := os.Stat(c.dlDir); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("soulseek download dir %s not accessible "+
+			"(mount slskd's downloads folder there, or set SLSKD_DOWNLOAD_DIR)", c.dlDir)
+	}
 	queries := []string{
 		strings.TrimSpace(strings.Join(strings.Fields(artist+" "+album), " ")),
 		strings.TrimSpace(strings.Join(strings.Fields(artist+" "+title), " ")),
