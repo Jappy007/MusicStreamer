@@ -43,10 +43,14 @@ docker compose up --build -d
 
 This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
 
-1. Open slskd at `http://<host>:5030`, enter your Soulseek login under
-   Settings (and set an API key → copy it to `SLSKD_API_KEY` in `.env`,
-   then `docker compose up -d` again). No Soulseek login = Soulseek tier
-   stays idle; everything else works.
+1. Open slskd at `http://<host>:5030` (login `slskd`/`slskd`, change it),
+   enter your Soulseek login under Settings. Then set the API key **in
+   `docker-compose.yml`** (slskd service → uncomment `SLSKD_API_KEY`,
+   16+ chars), copy the same value to `SLSKD_API_KEY` in `.env`, and
+   `docker compose up -d` again. Key-in-compose survives recreates;
+   hand-edits to slskd.yml inside the container do not (and
+   `SLSKD_REMOTE_CONFIGURATION` is not needed for API use). No Soulseek
+   login = Soulseek tier stays idle; everything else works.
 2. Point Symfonium/Feishin at `http://<host>:4533`, user/pass from env,
    `?f=json` is honored automatically.
 3. Optional: uncomment the `prowlarr`/`lidarr` services in
