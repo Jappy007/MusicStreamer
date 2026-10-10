@@ -4,13 +4,18 @@
 ARG GO_VERSION=1.22
 
 FROM golang:${GO_VERSION}-alpine AS builder
+# TARGETARCH is supplied by buildx (amd64/arm64/...). Never hardcode GOARCH:
+# a forced arch mismatching the image arch fails at runtime with
+# "exec format error". When unset (plain docker build), Go defaults to the
+# builder's arch, which always matches the target image.
+ARG TARGETARCH
 WORKDIR /src
 RUN apk add --no-cache ca-certificates tzdata
 COPY go.mod ./
 # stdlib-only: no downloads, but keep the layer warm for future deps.
 RUN go mod download 2>/dev/null || true
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath \
     -ldflags="-s -w -extldflags '-static'" \
     -o /out/debridsubsonic .

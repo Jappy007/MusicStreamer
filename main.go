@@ -156,7 +156,7 @@ func main() {
 
 	httpSrv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           subsonic.WithAccessLog(mux),
+		Handler:           subsonic.WithAccessLog(subsonic.WithCORS(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		// No WriteTimeout: audio streams are long-lived; the request

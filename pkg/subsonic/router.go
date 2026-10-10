@@ -73,6 +73,23 @@ type statusRecorder struct {
 	code int
 }
 
+// WithCORS allows browser/web-based clients (Feishin web, Symfonium
+// wrappers, reverse-proxied setups) to call the API cross-origin.
+// Native apps are unaffected; preflights are answered without auth.
+func WithCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 func (s *statusRecorder) WriteHeader(code int) {
 	s.code = code
 	s.ResponseWriter.WriteHeader(code)
