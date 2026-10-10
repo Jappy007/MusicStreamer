@@ -5,9 +5,9 @@ Ultra-lightweight Subsonic-compatible music server (Go 1.22+, stdlib-only,
 
 Native clients (Symfonium, Feishin) connect as if it were Navidrome/Airsonic.
 
-## 3-tier `stream.view` pipeline
+## Resolution pipeline (`stream.view`, first hit wins)
 
-0. **Local library** (`MUSIC_DIR`, e.g. Lidarr's output folder) — files Lidarr
+0. **Local library** (`MUSIC_DIR`, e.g. Lidarr's output) — files Lidarr
    already downloaded play instantly, no cloud involved.
 1. **Local disk cache** (`CACHE_DIR`, LRU-capped at `CACHE_SIZE_GB`) — served
    with full `Range` / `206 Partial Content` seeking.
@@ -15,9 +15,11 @@ Native clients (Symfonium, Feishin) connect as if it were Navidrome/Airsonic.
    container, one batched `POST /v4/magnet/files` call resolves file trees,
    `POST /v4/link/unlock`, proxies bytes while Tee-spilling to cache.
    (Bearer auth; the legacy `GET /v4/magnet/status` is discontinued upstream.)
-3. **Scrape + fetch** — Prowlarr (private indexers, best quality), then
-   Soulseek via slskd when configured (music-native, often fastest for
-   audio), then the built-in public DHT index (torrents-csv, no keys needed).
+3. **Soulseek via slskd** when configured (music-native, often fastest for
+   audio) — search, download, serve from the shared download dir.
+4. **Debrid scrape, last resort** — Prowlarr, then the built-in public DHT
+   index, each fully resolved (search → upload → Ready) before the next
+   is tried, so one dead source never blocks the others.
    `magnet:` URIs go to `POST /v4/magnet/upload`; index `.torrent` links are
    fetched locally (they're LAN-only/key-gated) and pushed to
    `POST /v4/magnet/upload/file`. Then poll to `Ready`, unlock, proxy + cache.

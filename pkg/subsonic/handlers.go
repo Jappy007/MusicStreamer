@@ -486,12 +486,15 @@ func (s *Server) GetSong(w http.ResponseWriter, r *http.Request) {
 
 // --- stream: 3-tier pipeline ----------------------------------------------
 
-// Stream implements GET /rest/stream.view?id=...
+// Stream implements GET /rest/stream.view?id=... Each tier is tried in
+// order until one serves audio:
 //
 // Tier 0: local music library (Lidarr output, instant).
 // Tier 1: local disk cache (instant, Range-capable).
 // Tier 2: AllDebrid cloud (unlock + proxy, save to cache).
-// Tier 3: index scrape -> AllDebrid upload -> unlock -> proxy + cache.
+// Tier 3: Soulseek direct via slskd (music-native, often fastest).
+// Tier 4: debrid scrape, last resort — Prowlarr, then public indexes,
+// each fully resolved (search -> upload -> Ready) before the next.
 func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(w, r) {
 		return
@@ -588,93 +591,109 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	if len(albumsToTry) > 0 {
 		primaryAlbum = albumsToTry[0]
 	}
-	var candidates []string
-	picked, via := "", ""
-	if s.indexer != nil && s.indexer.Enabled() {
-		// Try specific -> general queries: edition tags in parens ("(Revised
-		// International Deluxe)") routinely match nothing on indexers, while a
-		// plain "artist album" query hits the same torrents.
-		for _, q := range queries {
-			ictx, cancel := context.WithTimeout(ctx, 25*time.Second)
-			c, err := s.indexer.Search(ictx, q, 5)
-			cancel()
-			if err != nil {
-				log.Printf("stream: %q - %q: indexer %q: %v", artist, title, q, err)
-				continue
-			}
-			if len(c) > 0 {
-				candidates, picked, via = c, q, "prowlarr"
-				break
-			}
-		}
-	} else {
-		log.Printf("stream: %q - %q: prowlarr not configured, using public indexes", artist, title)
-	}
-	if len(candidates) == 0 && s.soulseek != nil && s.soulseek.Enabled() {
-		// Soulseek direct: music-native network, often faster than DHT
-		// for audio. Needs slskd configured (SLSKD_URL/SLSKD_DOWNLOAD_DIR).
+	// Tier 3: Soulseek direct (music-native network, often faster than DHT
+	// for audio). Needs slskd configured (SLSKD_URL/SLSKD_DOWNLOAD_DIR).
+	// Failure falls through to the debrid scrape below.
+	if s.soulseek != nil && s.soulseek.Enabled() {
 		if path, err := s.soulseek.FetchTrack(ctx, artist, album, title); err != nil {
-			log.Printf("stream: %q - %q: soulseek: %v", artist, title, err)
+			log.Printf("stream: %q - %q: soulseek failed (%v), trying debrid scrape", artist, title, err)
 		} else {
 			log.Printf("stream: %q - %q: tier=soulseek", artist, title)
 			s.serveCached(w, r, path)
 			return
 		}
 	}
-	if len(candidates) == 0 && s.public != nil {
-		// Zero-config fallback: public torrent indexes. Only the first few
-		// (most specific) queries, to bound latency on slow public APIs.
-		pubQueries := queries
-		if len(pubQueries) > 3 {
-			pubQueries = pubQueries[:3]
+
+	// Tier 4: debrid scrape, last resort. Each backend is fully resolved
+	// (search -> upload -> Ready) before the next is tried, so a dead
+	// Prowlarr result set or a failed upload never blocks the public
+	// fallback. AllDebrid itself has no search API — it can only download
+	// magnets something else found.
+	type indexBackend struct {
+		name    string
+		enabled bool
+		queries []string
+		search  func(ctx context.Context, q string) ([]string, error)
+	}
+	pubQueries := queries
+	if len(pubQueries) > 3 {
+		pubQueries = pubQueries[:3] // bound latency on slow public APIs
+	}
+	backends := []indexBackend{
+		{name: "prowlarr", enabled: s.indexer != nil && s.indexer.Enabled(), queries: queries, search: func(c context.Context, q string) ([]string, error) {
+			return s.indexer.Search(c, q, 5)
+		}},
+		{name: "public", enabled: s.public != nil, queries: pubQueries, search: func(c context.Context, q string) ([]string, error) {
+			return s.public.Search(c, q, 5)
+		}},
+	}
+	for _, b := range backends {
+		if !b.enabled {
+			continue
 		}
-		for _, q := range pubQueries {
-			pctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-			c, err := s.public.Search(pctx, q, 5)
+		// Try specific -> general queries: edition tags in parens ("(Revised
+		// International Deluxe)") routinely match nothing on indexers, while a
+		// plain "artist album" query hits the same torrents.
+		var candidates []string
+		picked := ""
+		for _, q := range b.queries {
+			sctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+			c, err := b.search(sctx, q)
 			cancel()
 			if err != nil {
-				log.Printf("stream: %q - %q: public index %q: %v", artist, title, q, err)
+				log.Printf("stream: %q - %q: %s %q: %v", artist, title, b.name, q, err)
 				continue
 			}
 			if len(c) > 0 {
-				candidates, picked, via = c, q, "public"
+				candidates, picked = c, q
 				break
 			}
 		}
-	}
-	if len(candidates) == 0 {
-		log.Printf("stream: %q - %q: FAILED (no index returned results)", artist, title)
-		writeFail(w, r, 70, "No index results for \""+artist+" "+album+"\"")
-		return
-	}
-	log.Printf("stream: %q - %q: index %q via %s -> %d candidate(s)", artist, title, picked, via, len(candidates))
-	candidates = debrid.PreferAlbumTorrents(candidates, primaryAlbum)
-	for i, cnd := range candidates {
-		head := cnd
-		if len(head) > 150 {
-			head = head[:150]
+		if len(candidates) == 0 {
+			log.Printf("stream: %q - %q: %s returned no results, trying next", artist, title, b.name)
+			continue
 		}
-		log.Printf("stream: candidate[%d] len=%d head=%q", i, len(cnd), head)
+		log.Printf("stream: %q - %q: index %q via %s -> %d candidate(s)", artist, title, picked, b.name, len(candidates))
+		candidates = debrid.PreferAlbumTorrents(candidates, primaryAlbum)
+		for i, cnd := range candidates {
+			head := cnd
+			if len(head) > 150 {
+				head = head[:150]
+			}
+			log.Printf("stream: candidate[%d] len=%d head=%q", i, len(cnd), head)
+		}
+		if s.serveDebridCandidates(w, r, id, artist, title, b.name, candidates) {
+			return
+		}
 	}
-	uctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	log.Printf("stream: %q - %q: FAILED (no source resolved)", artist, title)
+	writeFail(w, r, 70, "No index results for \""+artist+" "+album+"\"")
+}
+
+// serveDebridCandidates uploads one backend's candidates, waits for Ready,
+// picks the track audio and proxies it. It reports true when the response
+// is complete (or terminally broken mid-stream, after headers went out),
+// false when the next source should be tried (upload failed or the ready
+// torrent holds no playable audio — both pre-header failures).
+func (s *Server) serveDebridCandidates(w http.ResponseWriter, r *http.Request, id, artist, title, via string, candidates []string) bool {
+	uctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
 	mg, err := s.debrid.EnsureSeededUpload(uctx, candidates, 90*time.Second)
-	cancel()
 	if err != nil {
-		log.Printf("stream: %q - %q: FAILED (debrid upload: %v)", artist, title, err)
-		writeFail(w, r, 0, "Debrid upload failed: "+err.Error())
-		return
+		log.Printf("stream: %q - %q: %s upload failed (%v), trying next", artist, title, via, err)
+		return false
 	}
 	file, ok := debrid.PickAudioFile(mg.Links, title)
 	if !ok {
-		log.Printf("stream: %q - %q: FAILED (no audio in %q)", artist, title, mg.Filename)
-		writeFail(w, r, 70, "No audio file in torrent \""+mg.Filename+"\"")
-		return
+		log.Printf("stream: %q - %q: no audio in %q, trying next", artist, title, mg.Filename)
+		return false
 	}
 	log.Printf("stream: %q - %q: tier=scrape (%s / %s)", artist, title, mg.Filename, file.Filename)
 	if !s.proxyUnlocked(w, r, id, mg, file) {
 		log.Printf("stream: %q - %q: FAILED (scraped proxy failed)", artist, title)
 		writeFail(w, r, 0, "Streaming failed for \""+title+"\"")
 	}
+	return true
 }
 
 // proxyUnlocked unlocks file.Link and proxies bytes to the client while
