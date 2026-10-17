@@ -313,26 +313,29 @@ func (c *Client) listDownloads(ctx context.Context, username string) ([]transfer
 	return flat, nil
 }
 
-func terminalOK(state string) bool { return strings.EqualFold(state, "Completed") }
-
-// errCandidateUnusable marks a failure worth trying the next peer for
-// (enqueue rejected, transfer terminally failed). Trivial conditions —
-// a context deadline or a transfer still in progress — must NOT hop:
-// slskd keeps downloading server-side, so a retry converges on the same
-// file rather than queueing a different one.
-var errCandidateUnusable = errors.New("candidate unusable")
+// slskd reports transfer state as combined flags joined by ", " (e.g.
+// "Queued, Remotely", "Completed, Succeeded", "Completed, Errored"). A bare
+// equality check against "Completed" never matches a real success, so
+// finished downloads would spin forever.
+func terminalOK(state string) bool {
+	s := strings.ToLower(state)
+	return strings.Contains(s, "succeeded") || strings.TrimSpace(s) == "completed"
+}
 
 func terminalBad(state string) bool {
-	switch {
-	case strings.EqualFold(state, "Failed"),
-		strings.EqualFold(state, "Rejected"),
-		strings.EqualFold(state, "TimedOut"),
-		strings.EqualFold(state, "Cancelled"),
-		strings.EqualFold(state, "Canceled"):
-		return true
+	s := strings.ToLower(state)
+	for _, f := range []string{"errored", "cancelled", "canceled", "rejected", "timedout", "timed out", "failed"} {
+		if strings.Contains(s, f) {
+			return true
+		}
 	}
 	return false
 }
+
+// errEnqueueFailed means no transfer was created for a candidate, so trying
+// the next peer is safe (nothing was queued). Once a transfer exists, we
+// stick with it: a retry converges rather than downloading a second copy.
+var errEnqueueFailed = errors.New("enqueue failed")
 
 // FetchTrackShared is the coalesced entry point handlers call. Concurrent
 // requests for the same track collapse onto one leader: the leader runs
@@ -402,28 +405,24 @@ func (c *Client) FetchTrack(ctx context.Context, artist, album, title string) (s
 	}
 	dctx, cancel := context.WithTimeout(ctx, downloadTimeout)
 	defer cancel()
-	var lastErr error
-	for i, cd := range cands {
-		if i >= 3 {
-			break // bound peer-hopping per stream
-		}
-		path, err := c.fetchOne(dctx, cd)
-		if err == nil {
+	// One pick, stuck to: pick the best candidate and commit. We only move
+	// to the next peer when the enqueue itself failed (no transfer was
+	// created, so nothing is downloading). Once a transfer exists we wait
+	// for it — never queueing a second, different copy of the same song.
+	cd := cands[0]
+	log.Printf("soulseek: %q - %q: chose %s @%s", artist, title, filepath.Base(cd.Filename), cd.Username)
+	path, err := c.fetchOne(dctx, cd)
+	if err == nil {
+		return path, nil
+	}
+	for i := 1; i < len(cands) && errors.Is(err, errEnqueueFailed); i++ {
+		cd = cands[i]
+		log.Printf("soulseek: %q - %q: enqueue failed, trying %s @%s", artist, title, filepath.Base(cd.Filename), cd.Username)
+		if path, err = c.fetchOne(dctx, cd); err == nil {
 			return path, nil
 		}
-		log.Printf("soulseek: %s@%s: %v", cd.Filename, cd.Username, err)
-		if !errors.Is(err, errCandidateUnusable) {
-			// Stick with the pick already being downloaded server-side:
-			// hopping would queue a second, different file. A retry
-			// converges on the same one instead.
-			return "", err
-		}
-		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = errors.New("soulseek: all candidates failed")
-	}
-	return "", lastErr
+	return "", err
 }
 
 // fetchOne ensures one candidate is downloaded and resolves its local path.
@@ -439,13 +438,14 @@ func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
 			}
 			switch {
 			case terminalOK(f.State):
+				needEnqueue = false
 				if p, ok := c.resolve(cd.Filename); ok {
 					return p, nil
 				}
 			case terminalBad(f.State):
 				// Stale failure: fall through and try enqueueing again.
 			default:
-				log.Printf("soulseek: %s already %s, waiting on it", cd.Filename, f.State)
+				log.Printf("soulseek: %s already %s, waiting on it", filepath.Base(cd.Filename), f.State)
 				needEnqueue = false
 			}
 		}
@@ -453,11 +453,12 @@ func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
 	if needEnqueue {
 		if err := c.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+cd.Username,
 			[]map[string]any{{"filename": cd.Filename, "size": cd.Size}}, nil); err != nil {
-			return "", fmt.Errorf("%w: enqueue: %v", errCandidateUnusable, err)
+			return "", fmt.Errorf("%w: %v", errEnqueueFailed, err)
 		}
 	}
 	t := time.NewTicker(xferPollEvery)
 	defer t.Stop()
+	lastState := ""
 	for {
 		files, err := c.listDownloads(ctx, cd.Username)
 		if err != nil {
@@ -467,15 +468,30 @@ func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
 			if !sameTrack(f.Filename, cd.Filename) {
 				continue
 			}
+			if f.State != lastState {
+				log.Printf("soulseek: %s @%s: %s", filepath.Base(cd.Filename), cd.Username, f.State)
+				lastState = f.State
+			}
 			switch {
 			case terminalOK(f.State):
-				if p, ok := c.resolve(cd.Filename); ok {
-					return p, nil
+				// slskd may report Completed before the file is moved out of
+				// the incomplete dir; give the move a moment before failing.
+				for i := 0; i < 15; i++ {
+					if p, ok := c.resolve(cd.Filename); ok {
+						return p, nil
+					}
+					select {
+					case <-ctx.Done():
+						return "", ctx.Err()
+					case <-time.After(time.Second):
+					}
 				}
-				return "", fmt.Errorf("soulseek: %s completed but not found under %s [%s]",
-					filepath.Base(cd.Filename), c.dlDir, c.dirSample())
+				return "", fmt.Errorf("soulseek: %s %s but not found under %s [%s]",
+					filepath.Base(cd.Filename), f.State, c.dlDir, c.dirSample())
 			case terminalBad(f.State):
-				return "", fmt.Errorf("%w: transfer %s", errCandidateUnusable, f.State)
+				// The transfer was created and ended badly. Do not hop:
+				// a retry re-searches and re-picks cleanly.
+				return "", fmt.Errorf("soulseek: %s @%s: %s", filepath.Base(cd.Filename), cd.Username, f.State)
 			}
 		}
 		select {
