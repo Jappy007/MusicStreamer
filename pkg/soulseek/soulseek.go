@@ -315,6 +315,13 @@ func (c *Client) listDownloads(ctx context.Context, username string) ([]transfer
 
 func terminalOK(state string) bool { return strings.EqualFold(state, "Completed") }
 
+// errCandidateUnusable marks a failure worth trying the next peer for
+// (enqueue rejected, transfer terminally failed). Trivial conditions —
+// a context deadline or a transfer still in progress — must NOT hop:
+// slskd keeps downloading server-side, so a retry converges on the same
+// file rather than queueing a different one.
+var errCandidateUnusable = errors.New("candidate unusable")
+
 func terminalBad(state string) bool {
 	switch {
 	case strings.EqualFold(state, "Failed"),
@@ -401,12 +408,17 @@ func (c *Client) FetchTrack(ctx context.Context, artist, album, title string) (s
 			break // bound peer-hopping per stream
 		}
 		path, err := c.fetchOne(dctx, cd)
-		if err != nil {
-			log.Printf("soulseek: %s@%s: %v", cd.Filename, cd.Username, err)
-			lastErr = err
-			continue
+		if err == nil {
+			return path, nil
 		}
-		return path, nil
+		log.Printf("soulseek: %s@%s: %v", cd.Filename, cd.Username, err)
+		if !errors.Is(err, errCandidateUnusable) {
+			// Stick with the pick already being downloaded server-side:
+			// hopping would queue a second, different file. A retry
+			// converges on the same one instead.
+			return "", err
+		}
+		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = errors.New("soulseek: all candidates failed")
@@ -441,7 +453,7 @@ func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
 	if needEnqueue {
 		if err := c.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+cd.Username,
 			[]map[string]any{{"filename": cd.Filename, "size": cd.Size}}, nil); err != nil {
-			return "", err
+			return "", fmt.Errorf("%w: enqueue: %v", errCandidateUnusable, err)
 		}
 	}
 	t := time.NewTicker(xferPollEvery)
@@ -460,9 +472,10 @@ func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
 				if p, ok := c.resolve(cd.Filename); ok {
 					return p, nil
 				}
-				return "", errors.New("soulseek: completed but file not on disk")
+				return "", fmt.Errorf("soulseek: %s completed but not found under %s [%s]",
+					filepath.Base(cd.Filename), c.dlDir, c.dirSample())
 			case terminalBad(f.State):
-				return "", fmt.Errorf("soulseek: transfer %s", f.State)
+				return "", fmt.Errorf("%w: transfer %s", errCandidateUnusable, f.State)
 			}
 		}
 		select {
@@ -545,6 +558,30 @@ func sameTrack(a, b string) bool {
 		bb = bb[i+1:]
 	}
 	return strings.EqualFold(strings.TrimSpace(ab), strings.TrimSpace(bb))
+}
+
+// dirSample lists a few files under the download dir for diagnostics when
+// a completed transfer cannot be found on disk (usually a mount mismatch:
+// SLSKD_DOWNLOAD_DIR must point at slskd's own completed-downloads folder).
+func (c *Client) dirSample() string {
+	var names []string
+	_ = filepath.WalkDir(c.dlDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		names = append(names, filepath.Base(p))
+		if len(names) >= 5 {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if len(names) == 0 {
+		return "no files"
+	}
+	return strings.Join(names, ", ")
 }
 
 func alnum(s string) string {

@@ -531,8 +531,10 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 
 	// Dedupe thundering herds: one resolution per song at a time.
 	if !s.claim(id) {
-		// Another goroutine is fetching; wait briefly for the cache fill.
-		if s.waitForCache(r.Context(), id, 60*time.Second) {
+		// Another goroutine is fetching (possibly a slow Soulseek
+		// download). Wait for the cache to fill — the fetch writes it
+		// there on success — bounded by the client's own request context.
+		if s.waitForCache(r.Context(), id, 10*time.Minute) {
 			if path, ok := s.storage.Lookup(id); ok {
 				s.serveCached(w, r, path)
 				return
@@ -599,7 +601,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 			log.Printf("stream: %q - %q: soulseek failed (%v), trying debrid scrape", artist, title, err)
 		} else {
 			log.Printf("stream: %q - %q: tier=soulseek", artist, title)
-			s.serveCached(w, r, path)
+			s.serveSoulseek(w, r, id, path)
 			return
 		}
 	}
@@ -786,6 +788,26 @@ func (s *Server) backgroundFill(id, directURL, filename string) {
 	defer resp.Body.Close()
 	// Bounded: refuse absurd bodies (>2 GiB single track).
 	_ = s.storage.Store(id, io.LimitReader(resp.Body, 2<<30))
+}
+
+// serveSoulseek promotes a Soulseek-downloaded file into the disk cache
+// (so retries, concurrent requesters and Range seeks all converge on a
+// normal cache entry) and serves it. If the copy into the cache fails the
+// file is served in place rather than failing playback.
+func (s *Server) serveSoulseek(w http.ResponseWriter, r *http.Request, id, path string) {
+	if f, err := os.Open(path); err == nil {
+		if serr := s.storage.Store(id, f); serr != nil {
+			log.Printf("stream: cache store %s: %v", id, serr)
+		}
+		_ = f.Close()
+	} else {
+		log.Printf("stream: open soulseek file %s: %v", path, err)
+	}
+	if cpath, ok := s.storage.Lookup(id); ok {
+		s.serveCached(w, r, cpath)
+		return
+	}
+	s.serveCached(w, r, path)
 }
 
 // serveCached serves a cache file with sniffed content type and full
