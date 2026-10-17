@@ -190,6 +190,12 @@ type SongEntry struct {
 	AlbumID     string   `xml:"albumId,attr,omitempty" json:"albumId,omitempty"`
 	ArtistID    string   `xml:"artistId,attr,omitempty" json:"artistId,omitempty"`
 	Type        string   `xml:"type,attr,omitempty" json:"type,omitempty"`
+
+	// OpenSubsonic audio properties (present for cached/local files where the
+	// bytes can be inspected).
+	SamplingRate int `xml:"samplingRate,attr,omitempty" json:"samplingRate,omitempty"`
+	BitDepth     int `xml:"bitDepth,attr,omitempty" json:"bitDepth,omitempty"`
+	ChannelCount int `xml:"channelCount,attr,omitempty" json:"channelCount,omitempty"`
 }
 
 type AlbumEntry struct {

@@ -240,6 +240,14 @@ func (m *Manager) Stats() (int, int64, int64) {
 	return len(m.size), m.total, m.maxBytes
 }
 
+// Size returns the cached byte size for name, if present.
+func (m *Manager) Size(name string) (int64, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s, ok := m.size[name]
+	return s, ok
+}
+
 // IDs returns a snapshot of the cache keys (song IDs), sorted. Because keys
 // are the reversible Subsonic song IDs, callers can rebuild track identity
 // (artist/album/title) from them — this is how the cache is surfaced as a

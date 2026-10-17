@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/debridsubsonic/debridsubsonic/pkg/audioinfo"
 	"github.com/debridsubsonic/debridsubsonic/pkg/cache"
 	"github.com/debridsubsonic/debridsubsonic/pkg/debrid"
 	"github.com/debridsubsonic/debridsubsonic/pkg/library"
@@ -37,6 +38,18 @@ type Server struct {
 
 	mu       sync.Mutex
 	inflight map[string]struct{} // song IDs currently being resolved/fetched
+
+	// info memoizes probed audio properties (format/sample rate/bit depth)
+	// per cached song id; size invalidates the entry on re-download.
+	infoMu sync.Mutex
+	info   map[string]infoCache
+}
+
+// infoCache stores a probed track's properties alongside the file size they
+// were derived from.
+type infoCache struct {
+	size int64
+	info audioinfo.Info
 }
 
 // NewServer builds a handler set. proxy may be nil (a default is used).
@@ -508,9 +521,8 @@ func (s *Server) GetSong(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Cached track: return it as-is (no network round-trip needed).
-	if cs, ok := s.catalog().has(id); ok {
+	if e, ok := s.catalog().songForID(id); ok {
 		resp := okResponse()
-		e := cs.entry()
 		resp.Song = &e
 		write(w, r, resp)
 		return

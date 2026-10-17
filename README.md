@@ -93,9 +93,18 @@ reflect what is downloaded right now (cached tracks surface first and play
 instantly). Entries evicted by the LRU simply disappear from the browse tree;
 tracks not yet cached still resolve on demand through the tier pipeline.
 
+Cached tracks also report their real **file type**, **sample rate** and
+**bit depth** (and channels/bitrate where known): the bytes are sniffed by
+`pkg/audioinfo` (FLAC, MP3, WAV, AIFF, Ogg Vorbis, Opus, MP4/M4A AAC & ALAC,
+WMA), exposed through the OpenSubsonic `suffix`, `contentType`,
+`samplingRate`, `bitDepth` and `channelCount` song attributes, plus `size`.
+Results are memoized per cache entry (keyed by id + size), so browsing stays
+cheap — a file is read at most once.
+
 ## Layout
 
 - `main.go` — env config, cache + cleaner, HTTP server, graceful shutdown
+- `pkg/audioinfo/` — header-only audio format / sample-rate / bit-depth sniffing
 - `pkg/cache/` — RWMutex-guarded LRU, atomic tmp→rename writes, background purge
 - `pkg/debrid/` — AllDebrid v4 client (context timeouts) + Prowlarr search
 - `pkg/metadata/` — Deezer/MusicBrainz → canonical `Song`

@@ -2,9 +2,11 @@ package subsonic
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/debridsubsonic/debridsubsonic/pkg/audioinfo"
 	"github.com/debridsubsonic/debridsubsonic/pkg/metadata"
 )
 
@@ -14,18 +16,7 @@ import (
 type cachedSong struct {
 	id                   string
 	artist, album, title string
-}
-
-func (c cachedSong) entry() SongEntry {
-	return SongEntry{
-		ID: c.id, Parent: metadata.EncodeID(c.artist, c.album, ""), IsDir: false,
-		Title: c.title, Album: displayAlbum(c.album), Artist: c.artist,
-		CoverArt: metadata.EncodeID(c.artist, c.album, ""),
-		Path:     fmt.Sprintf("%s/%s/%s", c.artist, displayAlbum(c.album), c.title),
-		AlbumID:  metadata.EncodeID(c.artist, c.album, ""),
-		ArtistID: metadata.EncodeID(c.artist, "", ""),
-		Type:     "music",
-	}
+	size                 int64
 }
 
 // catalog is an in-memory view of the disk cache grouped for browsing.
@@ -33,6 +24,7 @@ func (c cachedSong) entry() SongEntry {
 // bytes each) so it always reflects the current LRU state with no cache of
 // its own to invalidate.
 type catalog struct {
+	s        *Server
 	songs    []cachedSong
 	byArtist map[string]map[string][]cachedSong // artist -> album -> songs
 	artists  []string
@@ -47,7 +39,7 @@ func displayAlbum(album string) string {
 
 // catalog snapshots the disk cache into a browse tree.
 func (s *Server) catalog() *catalog {
-	c := &catalog{byArtist: make(map[string]map[string][]cachedSong)}
+	c := &catalog{s: s, byArtist: make(map[string]map[string][]cachedSong)}
 	if s.storage == nil {
 		return c
 	}
@@ -64,7 +56,8 @@ func (s *Server) catalog() *catalog {
 		if strings.TrimSpace(artist) == "" {
 			artist = "Unknown Artist"
 		}
-		cs := cachedSong{id: id, artist: artist, album: album, title: title}
+		size, _ := s.storage.Size(id)
+		cs := cachedSong{id: id, artist: artist, album: album, title: title, size: size}
 		c.songs = append(c.songs, cs)
 		am := c.byArtist[artist]
 		if am == nil {
@@ -95,6 +88,38 @@ func lessSong(a, b cachedSong) bool {
 		return strings.ToLower(a.title) < strings.ToLower(b.title)
 	}
 	return a.id < b.id
+}
+
+// entry builds a Subsonic song entry for a cached track, probing the file for
+// format / sample rate / bit depth (memoized per id+size).
+func (c *catalog) entry(cs cachedSong) SongEntry {
+	return c.s.cachedEntry(cs)
+}
+
+// cachedEntry renders a cached track, including OpenSubsonic audio properties
+// discovered from the file bytes.
+func (s *Server) cachedEntry(cs cachedSong) SongEntry {
+	albumID := metadata.EncodeID(cs.artist, cs.album, "")
+	e := SongEntry{
+		ID: cs.id, Parent: albumID, IsDir: false,
+		Title: cs.title, Album: displayAlbum(cs.album), Artist: cs.artist,
+		CoverArt: albumID,
+		Path:     fmt.Sprintf("%s/%s/%s", cs.artist, displayAlbum(cs.album), cs.title),
+		AlbumID:  albumID, ArtistID: metadata.EncodeID(cs.artist, "", ""),
+		Type: "music", Size: cs.size,
+	}
+	if s.storage != nil {
+		info := s.fileInfo(cs.id, filepath.Join(s.storage.Dir(), cs.id), cs.size)
+		e.Suffix = info.Suffix()
+		e.ContentType = info.ContentType()
+		e.SamplingRate = info.SampleRate
+		e.BitDepth = info.BitDepth
+		e.ChannelCount = info.Channels
+		if info.BitRate > 0 {
+			e.BitRate = info.BitRate
+		}
+	}
+	return e
 }
 
 // artistEntries lists artists (with album counts) for getArtists/getIndexes.
@@ -158,7 +183,7 @@ func (c *catalog) artistAlbums(artist string) []AlbumEntry {
 func (c *catalog) albumSongs(artist, album string) []SongEntry {
 	var out []SongEntry
 	for _, cs := range c.byArtist[artist][album] {
-		out = append(out, cs.entry())
+		out = append(out, c.entry(cs))
 	}
 	return out
 }
@@ -181,18 +206,41 @@ func (c *catalog) searchSongs(query string) []SongEntry {
 			}
 		}
 		if ok {
-			out = append(out, cs.entry())
+			out = append(out, c.entry(cs))
 		}
 	}
 	return out
 }
 
-// has reports whether the cache holds a track with exactly this id.
-func (c *catalog) has(id string) (cachedSong, bool) {
+// songForID returns the entry for a cached track with exactly this id.
+func (c *catalog) songForID(id string) (SongEntry, bool) {
 	for _, cs := range c.songs {
 		if cs.id == id {
-			return cs, true
+			return c.entry(cs), true
 		}
 	}
-	return cachedSong{}, false
+	return SongEntry{}, false
+}
+
+// fileInfo probes a cached file's audio properties, memoized by id and size
+// (size changes only if the track is re-downloaded, invalidating the memo).
+func (s *Server) fileInfo(id, path string, size int64) audioinfo.Info {
+	s.infoMu.Lock()
+	if e, ok := s.info[id]; ok && e.size == size {
+		s.infoMu.Unlock()
+		return e.info
+	}
+	s.infoMu.Unlock()
+
+	info, err := audioinfo.ProbeFile(path)
+	if err != nil {
+		info = audioinfo.Info{}
+	}
+	s.infoMu.Lock()
+	if s.info == nil {
+		s.info = make(map[string]infoCache)
+	}
+	s.info[id] = infoCache{size: size, info: info}
+	s.infoMu.Unlock()
+	return info
 }
