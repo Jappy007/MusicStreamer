@@ -790,22 +790,21 @@ func (s *Server) backgroundFill(id, directURL, filename string) {
 	_ = s.storage.Store(id, io.LimitReader(resp.Body, 2<<30))
 }
 
-// serveSoulseek promotes a Soulseek-downloaded file into the disk cache
-// (so retries, concurrent requesters and Range seeks all converge on a
-// normal cache entry) and serves it. If the copy into the cache fails the
-// file is served in place rather than failing playback.
+// serveSoulseek serves a Soulseek-downloaded file the instant it is complete
+// and promotes it into the disk cache in the background. Serving first means
+// playback starts immediately; the background copy (atomic tmp+rename) makes
+// later plays, concurrent clients and Range seeks converge on a stable cache
+// entry even if slskd later prunes the download.
 func (s *Server) serveSoulseek(w http.ResponseWriter, r *http.Request, id, path string) {
 	if f, err := os.Open(path); err == nil {
-		if serr := s.storage.Store(id, f); serr != nil {
-			log.Printf("stream: cache store %s: %v", id, serr)
-		}
-		_ = f.Close()
+		go func() {
+			defer f.Close()
+			if serr := s.storage.Store(id, f); serr != nil {
+				log.Printf("stream: cache store %s: %v", id, serr)
+			}
+		}()
 	} else {
 		log.Printf("stream: open soulseek file %s: %v", path, err)
-	}
-	if cpath, ok := s.storage.Lookup(id); ok {
-		s.serveCached(w, r, cpath)
-		return
 	}
 	s.serveCached(w, r, path)
 }

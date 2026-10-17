@@ -61,6 +61,13 @@ type Client struct {
 	// moment it completes — never a duplicate or a different pick.
 	fmu    sync.Mutex
 	flying map[string]*inflight
+
+	// enq remembers (username, filename) already enqueued this session so no
+	// retry, concurrent request, or unreadable transfer list can queue the
+	// same file twice. The download itself is idempotent from slskd's side,
+	// but duplicate *entries* are what we must avoid.
+	emu sync.Mutex
+	enq map[string]bool
 }
 
 type inflight struct {
@@ -84,6 +91,7 @@ func New(baseURL, apiKey, downloadDir string, httpClient *http.Client) *Client {
 		dlDir:   downloadDir,
 		http:    httpClient,
 		flying:  make(map[string]*inflight),
+		enq:     make(map[string]bool),
 	}
 }
 
@@ -131,7 +139,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return errors.New("slskd: HTTP 401 unauthorized — check SLSKD_API_KEY")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("slskd: %s %s: HTTP %d", method, path, resp.StatusCode)
+		return &httpError{method: method, path: path, code: resp.StatusCode}
 	}
 	if out == nil || len(data) == 0 {
 		return nil
@@ -140,6 +148,17 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return fmt.Errorf("slskd: decode %s %s: %w", method, path, err)
 	}
 	return nil
+}
+
+// httpError carries slskd's HTTP status so callers can special-case codes
+// (e.g. 404 from a transfer list for a user with no transfers).
+type httpError struct {
+	method, path string
+	code         int
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("slskd: %s %s: HTTP %d", e.method, e.path, e.code)
 }
 
 // Candidate is one downloadable network file.
@@ -306,6 +325,11 @@ func (c *Client) listDownloads(ctx context.Context, username string) ([]transfer
 		}
 		return out, nil
 	}
+	// A user with no transfers may 404: treat that as "none", not an error.
+	var he *httpError
+	if errors.As(err, &he) && he.code == http.StatusNotFound {
+		return nil, nil
+	}
 	var flat []transferFile
 	if ferr := c.do(ctx, http.MethodGet, "/api/v0/transfers/downloads/"+username, nil, &flat); ferr != nil {
 		return nil, err // original grouped error is more informative
@@ -317,11 +341,6 @@ func (c *Client) listDownloads(ctx context.Context, username string) ([]transfer
 // "Queued, Remotely", "Completed, Succeeded", "Completed, Errored"). A bare
 // equality check against "Completed" never matches a real success, so
 // finished downloads would spin forever.
-func terminalOK(state string) bool {
-	s := strings.ToLower(state)
-	return strings.Contains(s, "succeeded") || strings.TrimSpace(s) == "completed"
-}
-
 func terminalBad(state string) bool {
 	s := strings.ToLower(state)
 	for _, f := range []string{"errored", "cancelled", "canceled", "rejected", "timedout", "timed out", "failed"} {
@@ -425,81 +444,151 @@ func (c *Client) FetchTrack(ctx context.Context, artist, album, title string) (s
 	return "", err
 }
 
-// fetchOne ensures one candidate is downloaded and resolves its local path.
-// A completed earlier attempt serves instantly; a still-running one is
-// waited on, never re-enqueued (re-queueing the same file just duplicates
-// queue entries, and concurrent retries must not each pick anew).
+// fetchOne downloads exactly one candidate: it enqueues a transfer at most
+// once, waits for it to finish, then locates the completed file on disk.
+// It never enqueues a second copy — a transfer that already exists (in any
+// state) is waited on or reported, never re-queued.
 func (c *Client) fetchOne(ctx context.Context, cd Candidate) (string, error) {
-	needEnqueue := true
-	if files, err := c.listDownloads(ctx, cd.Username); err == nil {
-		for _, f := range files {
-			if !sameTrack(f.Filename, cd.Filename) {
-				continue
-			}
-			switch {
-			case terminalOK(f.State):
-				needEnqueue = false
-				if p, ok := c.resolve(cd.Filename); ok {
-					return p, nil
-				}
-			case terminalBad(f.State):
-				// Stale failure: fall through and try enqueueing again.
-			default:
-				log.Printf("soulseek: %s already %s, waiting on it", filepath.Base(cd.Filename), f.State)
-				needEnqueue = false
-			}
-		}
-	}
-	if needEnqueue {
-		if err := c.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+cd.Username,
-			[]map[string]any{{"filename": cd.Filename, "size": cd.Size}}, nil); err != nil {
-			return "", fmt.Errorf("%w: %v", errEnqueueFailed, err)
-		}
-	}
 	t := time.NewTicker(xferPollEvery)
 	defer t.Stop()
+	enqueued := false
+	mismatchLogged := false
 	lastState := ""
 	for {
-		files, err := c.listDownloads(ctx, cd.Username)
-		if err != nil {
-			return "", err
+		// Primary completion signal: slskd moves a finished file into its
+		// downloads dir. Its presence there (per slskd's own Files API) means
+		// the bytes are complete — independent of transfer-state wording.
+		if rel, ok := c.remoteRelPath(ctx, filepath.Base(cd.Filename)); ok {
+			p := filepath.Join(c.dlDir, rel)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return p, nil
+			}
+			if !mismatchLogged {
+				log.Printf("soulseek: slskd reports %q but it is not readable at %s "+
+					"(SLSKD_DOWNLOAD_DIR mount mismatch?)", rel, c.dlDir)
+				mismatchLogged = true
+			}
+		} else if p, ok := c.resolve(cd.Filename); ok {
+			// Files API unavailable/empty: fall back to a local scan of the
+			// downloads dir (incomplete subdirs are ignored).
+			return p, nil
 		}
-		for _, f := range files {
-			if !sameTrack(f.Filename, cd.Filename) {
-				continue
+		files, err := c.listDownloads(ctx, cd.Username)
+		switch {
+		case err != nil:
+			log.Printf("soulseek: transfer list for %s: %v", cd.Username, err)
+			if !enqueued {
+				did, eerr := c.enqueue(ctx, cd)
+				if eerr != nil {
+					return "", fmt.Errorf("%w: %v", errEnqueueFailed, eerr)
+				}
+				enqueued = true
+				if did {
+					log.Printf("soulseek: queued %s @%s", filepath.Base(cd.Filename), cd.Username)
+				}
 			}
-			if f.State != lastState {
-				log.Printf("soulseek: %s @%s: %s", filepath.Base(cd.Filename), cd.Username, f.State)
-				lastState = f.State
+		default:
+			state := ""
+			for _, f := range files {
+				if sameTrack(f.Filename, cd.Filename) {
+					state = f.State
+					break
+				}
 			}
-			switch {
-			case terminalOK(f.State):
-				// slskd may report Completed before the file is moved out of
-				// the incomplete dir; give the move a moment before failing.
-				for i := 0; i < 15; i++ {
-					if p, ok := c.resolve(cd.Filename); ok {
-						return p, nil
+			if state == "" {
+				if !enqueued {
+					did, eerr := c.enqueue(ctx, cd)
+					if eerr != nil {
+						return "", fmt.Errorf("%w: %v", errEnqueueFailed, eerr)
 					}
-					select {
-					case <-ctx.Done():
-						return "", ctx.Err()
-					case <-time.After(time.Second):
+					enqueued = true
+					if did {
+						log.Printf("soulseek: queued %s @%s", filepath.Base(cd.Filename), cd.Username)
 					}
 				}
-				return "", fmt.Errorf("soulseek: %s %s but not found under %s [%s]",
-					filepath.Base(cd.Filename), f.State, c.dlDir, c.dirSample())
-			case terminalBad(f.State):
-				// The transfer was created and ended badly. Do not hop:
-				// a retry re-searches and re-picks cleanly.
-				return "", fmt.Errorf("soulseek: %s @%s: %s", filepath.Base(cd.Filename), cd.Username, f.State)
+			} else if state != lastState {
+				log.Printf("soulseek: %s @%s: %s", filepath.Base(cd.Filename), cd.Username, state)
+				lastState = state
+				if terminalBad(state) {
+					return "", fmt.Errorf("soulseek: %s @%s: %s", filepath.Base(cd.Filename), cd.Username, state)
+				}
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", fmt.Errorf("soulseek: %s @%s did not appear under %s [%s]: %w",
+				filepath.Base(cd.Filename), cd.Username, c.dlDir, c.dirSample(), ctx.Err())
 		case <-t.C:
 		}
 	}
+}
+
+// enqueue queues exactly one file for download from a peer, at most once
+// per session (per username+filename). A repeat call is a no-op so retries
+// can never pile up duplicate transfers.
+func (c *Client) enqueue(ctx context.Context, cd Candidate) (bool, error) {
+	key := cd.Username + "\x00" + cd.Filename
+	c.emu.Lock()
+	already := c.enq[key]
+	c.emu.Unlock()
+	if already {
+		return false, nil
+	}
+	if err := c.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+cd.Username,
+		[]map[string]any{{"filename": cd.Filename, "size": cd.Size}}, nil); err != nil {
+		return false, err
+	}
+	c.emu.Lock()
+	c.enq[key] = true
+	c.emu.Unlock()
+	return true, nil
+}
+
+// fsNode is a directory entry from slskd's Files API.
+type fsNode struct {
+	Name        string   `json:"name"`
+	FullName    string   `json:"fullName"`
+	FullNameAlt string   `json:"fullname"`
+	Files       []fsNode `json:"files"`
+	Directories []fsNode `json:"directories"`
+}
+
+func nodeName(n fsNode) string {
+	for _, s := range []string{n.Name, n.FullName, n.FullNameAlt} {
+		if s != "" {
+			return filepath.Base(strings.ReplaceAll(s, `\`, `/`))
+		}
+	}
+	return ""
+}
+
+// remoteRelPath returns the path of the file with the given basename,
+// relative to slskd's downloads root, per slskd's Files API.
+func (c *Client) remoteRelPath(ctx context.Context, base string) (string, bool) {
+	var root fsNode
+	if err := c.do(ctx, http.MethodGet, "/api/v0/files/downloads?recursive=true", nil, &root); err != nil {
+		return "", false
+	}
+	want := alnum(strings.ToLower(base))
+	var found string
+	var walk func(n fsNode, prefix string)
+	walk = func(n fsNode, prefix string) {
+		if found != "" {
+			return
+		}
+		for _, f := range n.Files {
+			nm := nodeName(f)
+			if nm != "" && alnum(strings.ToLower(nm)) == want {
+				found = filepath.Join(prefix, nm)
+				return
+			}
+		}
+		for _, d := range n.Directories {
+			walk(d, filepath.Join(prefix, nodeName(d)))
+		}
+	}
+	walk(root, "")
+	return found, found != ""
 }
 
 // resolve maps a Soulseek network filename to a file under the download
@@ -522,12 +611,18 @@ func (c *Client) resolve(networkName string) (string, bool) {
 	// Prefer per-user subdirs (slskd default layout), then root-level files.
 	if entries, err := os.ReadDir(c.dlDir); err == nil {
 		for _, e := range entries {
-			if !e.IsDir() {
+			if !e.IsDir() || isIncompleteDir(e.Name()) {
 				continue
 			}
 			var found string
 			_ = filepath.WalkDir(filepath.Join(c.dlDir, e.Name()), func(p string, d fs.DirEntry, err error) error {
-				if err != nil || d.IsDir() || found != "" {
+				if err != nil || found != "" {
+					return nil
+				}
+				if d.IsDir() {
+					if isIncompleteDir(d.Name()) {
+						return fs.SkipDir
+					}
 					return nil
 				}
 				if audioExts[strings.ToLower(filepath.Ext(p))] && match(filepath.Base(p)) {
@@ -549,7 +644,13 @@ func (c *Client) resolve(networkName string) (string, bool) {
 	// Download dir itself unreadable as a listing: deep scan attempt.
 	var found string
 	_ = filepath.WalkDir(c.dlDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || found != "" {
+		if err != nil || found != "" {
+			return nil
+		}
+		if d.IsDir() {
+			if isIncompleteDir(d.Name()) {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if audioExts[strings.ToLower(filepath.Ext(p))] && match(filepath.Base(p)) {
@@ -561,6 +662,16 @@ func (c *Client) resolve(networkName string) (string, bool) {
 		return found, true
 	}
 	return "", false
+}
+
+// isIncompleteDir reports whether a directory holds slskd's in-progress
+// downloads, which must never be served.
+func isIncompleteDir(name string) bool {
+	switch strings.ToLower(name) {
+	case "incomplete", ".incomplete", "tmp", ".tmp":
+		return true
+	}
+	return false
 }
 
 // sameTrack matches transfer entries to candidates across slskd's path
