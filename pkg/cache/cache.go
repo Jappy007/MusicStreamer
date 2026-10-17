@@ -240,6 +240,21 @@ func (m *Manager) Stats() (int, int64, int64) {
 	return len(m.size), m.total, m.maxBytes
 }
 
+// IDs returns a snapshot of the cache keys (song IDs), sorted. Because keys
+// are the reversible Subsonic song IDs, callers can rebuild track identity
+// (artist/album/title) from them — this is how the cache is surfaced as a
+// browsable library.
+func (m *Manager) IDs() []string {
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.size))
+	for n := range m.size {
+		ids = append(ids, n)
+	}
+	m.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
+}
+
 // Dir exposes the cache root for staging temp downloads.
 func (m *Manager) Dir() string { return m.dir }
 

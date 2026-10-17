@@ -69,17 +69,29 @@ This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
 | `/rest/getSong.view?id=` | decode ID + best-effort enrich |
 | `/rest/stream.view?id=` | 3-tier pipeline |
 | `/rest/getUser.view` | login probe (full stream/playlist roles) |
-| `/rest/getAlbum.view?id=` | album page: metadata-search track list, every song streamable |
+| `/rest/getAlbum.view?id=` | cached tracks for the album if present, else metadata-search track list; every song streamable |
 | `/rest/getCoverArt.view?id=` | proxies upstream artwork (any song/album/artist ID) |
-| `/rest/getAlbumList2.view` | empty ID3 album list (no persistent library) |
-| `/rest/getArtist.view?id=` | artist page: album list grouped from metadata search |
+| `/rest/getAlbumList2.view` | albums present in the disk cache |
+| `/rest/getArtist.view?id=` | cached albums for the artist, else grouped from metadata search |
 | `/rest/jukeboxControl.view` | stub: empty stopped queue |
 | `/rest/scrobble.view` | accepted and ignored (no history stored) |
-| `/rest/getMusicFolders`, `/rest/getIndexes`, `/rest/getArtists`, `/rest/getOpenSubsonicExtensions` | compat stubs |
-| `/rest/getPlaylists`, `/rest/getGenres`, `/rest/getAlbumList`, `/rest/getStarred`, `/rest/getStarred2` | empty-library stubs (no persistent library; tracks resolve via search+debrid) |
+| `/rest/getMusicFolders`, `/rest/getOpenSubsonicExtensions` | compat stubs |
+| `/rest/getIndexes`, `/rest/getArtists` | artists present in the disk cache |
+| `/rest/getAlbumList` | same as `getAlbumList2` (cache-backed) |
+| `/rest/getPlaylists`, `/rest/getGenres`, `/rest/getStarred`, `/rest/getStarred2` | empty-library stubs (no persistent library; tracks resolve via search+debrid) |
 | `/healthz` | container healthcheck |
 
 Auth: `t`/`s` token, `p` plaintext, `p=enc:<hex>` all accepted.
+
+## Library view
+
+There is no database. The disk cache **is** the library: every cached file is
+named with its reversible song ID, so `getArtists`/`getIndexes`,
+`getAlbumList`/`getAlbumList2`, `getArtist`, `getAlbum`, `getSong` and
+`search3` reconstruct artist → album → track from the cache keys and always
+reflect what is downloaded right now (cached tracks surface first and play
+instantly). Entries evicted by the LRU simply disappear from the browse tree;
+tracks not yet cached still resolve on demand through the tier pipeline.
 
 ## Layout
 

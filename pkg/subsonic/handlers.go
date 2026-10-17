@@ -123,8 +123,9 @@ func (s *Server) GetUser(w http.ResponseWriter, r *http.Request) {
 	write(w, r, resp)
 }
 
-// Library stubs: this server has no persistent library (tracks resolve via
-// metadata search + debrid), so these return valid empty envelopes.
+// Empty-library stubs: playlists/genres/starred have no persistent store on
+// this server (tracks resolve via metadata search + debrid). Album/artist
+// browse is cache-backed; see catalog.go.
 func (s *Server) Playlists(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(w, r) {
 		return
@@ -148,7 +149,7 @@ func (s *Server) AlbumList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.AlbumList = &AlbumList{}
+	resp.AlbumList = &AlbumList{Albums: s.catalog().albumEntries()}
 	write(w, r, resp)
 }
 
@@ -175,7 +176,7 @@ func (s *Server) AlbumList2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.AlbumList2 = &AlbumList2{}
+	resp.AlbumList2 = &AlbumList2{Albums: s.catalog().albumEntries()}
 	write(w, r, resp)
 }
 
@@ -198,6 +199,21 @@ func (s *Server) GetAlbum(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(artist+album) == "" {
 		writeFail(w, r, 70, "Album not found")
+		return
+	}
+	// Cached tracks are real, already-downloaded files: prefer them so the
+	// album page lists exactly what can play instantly.
+	if songs := s.catalog().albumSongs(artist, album); len(songs) > 0 {
+		resp := okResponse()
+		info := &AlbumInfo{
+			ID: id, Name: displayAlbum(album), Artist: artist,
+			ArtistID: metadata.EncodeID(artist, "", ""),
+			CoverArt: id,
+		}
+		info.Songs = songs
+		info.SongCount = len(songs)
+		resp.Album = info
+		write(w, r, resp)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -330,6 +346,15 @@ func (s *Server) GetArtist(w http.ResponseWriter, r *http.Request) {
 		writeFail(w, r, 70, "Artist not found")
 		return
 	}
+	// Prefer cached (already-downloaded) albums so the artist page reflects
+	// what is immediately playable.
+	if albums := s.catalog().artistAlbums(artist); len(albums) > 0 {
+		resp := okResponse()
+		info := &ArtistInfo{ID: id, Name: artist, CoverArt: id, Albums: albums, AlbumCount: len(albums)}
+		resp.Artist = info
+		write(w, r, resp)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	songs, err := s.meta.Search(ctx, artist, 50)
@@ -379,7 +404,7 @@ func (s *Server) Indexes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.Artists = &Artists{Ignored: "The An A"}
+	resp.Artists = &Artists{Ignored: "The An A", List: s.catalog().artistEntries()}
 	write(w, r, resp)
 }
 
@@ -431,17 +456,39 @@ func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
 		write(w, r, resp)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	songs, err := s.meta.Search(ctx, query, songCount)
-	if err != nil {
-		writeFail(w, r, 0, "search failed: "+err.Error())
-		return
-	}
 	resp := okResponse()
 	sr := &SearchResult{}
-	for _, m := range songs {
-		sr.Songs = append(sr.Songs, songToEntry(m))
+	seen := make(map[string]bool)
+	// Cached (already-downloaded) matches come first — they play instantly.
+	for _, e := range s.catalog().searchSongs(query) {
+		if len(sr.Songs) >= songCount {
+			break
+		}
+		if seen[e.ID] {
+			continue
+		}
+		seen[e.ID] = true
+		sr.Songs = append(sr.Songs, e)
+	}
+	if len(sr.Songs) < songCount {
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		songs, err := s.meta.Search(ctx, query, songCount)
+		if err != nil && len(sr.Songs) == 0 {
+			writeFail(w, r, 0, "search failed: "+err.Error())
+			return
+		}
+		for _, m := range songs {
+			if len(sr.Songs) >= songCount {
+				break
+			}
+			e := songToEntry(m)
+			if seen[e.ID] {
+				continue
+			}
+			seen[e.ID] = true
+			sr.Songs = append(sr.Songs, e)
+		}
 	}
 	resp.SearchResult3 = sr
 	write(w, r, resp)
@@ -458,6 +505,14 @@ func (s *Server) GetSong(w http.ResponseWriter, r *http.Request) {
 	artist, album, title, err := metadata.DecodeID(id)
 	if err != nil {
 		writeFail(w, r, 70, "Song not found")
+		return
+	}
+	// Cached track: return it as-is (no network round-trip needed).
+	if cs, ok := s.catalog().has(id); ok {
+		resp := okResponse()
+		e := cs.entry()
+		resp.Song = &e
+		write(w, r, resp)
 		return
 	}
 	m := metadata.Song{
