@@ -30,6 +30,7 @@ func Route(mux *http.ServeMux, s *Server) {
 	bind("/rest/getArtists", s.Indexes)
 	bind("/rest/getAlbumList", s.AlbumList)
 	bind("/rest/getAlbumList2", s.AlbumList2)
+	bind("/rest/getRandomSongs", s.RandomSongs)
 	bind("/rest/getAlbum", s.GetAlbum)
 	bind("/rest/getArtist", s.GetArtist)
 	bind("/rest/getCoverArt", s.CoverArt)

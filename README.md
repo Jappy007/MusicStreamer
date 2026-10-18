@@ -65,7 +65,8 @@ This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
 |---|---|
 | `/rest/ping.view` | auth check |
 | `/rest/getLicense.view` | static valid license |
-| `/rest/search3.view?query=&songCount=` | Deezer → MusicBrainz fallback |
+| `/rest/search3.view?query=&songCount=&songOffset=` | query empty → flat list of cached tracks (paginated); query set → cached matches first, then Deezer → MusicBrainz |
+| `/rest/getRandomSongs.view?size=` | flat list of every cached track (one entry per file) |
 | `/rest/getSong.view?id=` | decode ID + best-effort enrich |
 | `/rest/stream.view?id=` | 3-tier pipeline |
 | `/rest/getUser.view` | login probe (full stream/playlist roles) |
@@ -86,12 +87,17 @@ Auth: `t`/`s` token, `p` plaintext, `p=enc:<hex>` all accepted.
 ## Library view
 
 There is no database. The disk cache **is** the library: every cached file is
-named with its reversible song ID, so `getArtists`/`getIndexes`,
-`getAlbumList`/`getAlbumList2`, `getArtist`, `getAlbum`, `getSong` and
-`search3` reconstruct artist → album → track from the cache keys and always
-reflect what is downloaded right now (cached tracks surface first and play
-instantly). Entries evicted by the LRU simply disappear from the browse tree;
-tracks not yet cached still resolve on demand through the tier pipeline.
+named with its reversible song ID, so the tracks are reconstructed from the
+cache keys and always reflect what is downloaded right now.
+
+Tracks are exposed **one per cached file** (a flat, track-by-track list), which
+is what clients paginate for a "Songs" view: `search3` with an empty query
+(`songCount`/`songOffset`) and `getRandomSongs` return every cached track as an
+individual song entry. `getArtists`/`getIndexes`, `getAlbumList`/`getAlbumList2`,
+`getArtist`, `getAlbum`, `getSong` additionally group the same tracks as
+artist → album → track for Albums/Artists browsing. Entries evicted by the LRU
+simply disappear; tracks not yet cached still resolve on demand through the
+tier pipeline.
 
 Cached tracks also report their real **file type**, **sample rate** and
 **bit depth** (and channels/bitrate where known): the bytes are sniffed by

@@ -460,50 +460,88 @@ func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
 	if songCount < 1 {
 		songCount = 20
 	}
-	if songCount > 50 {
-		songCount = 50
+	if songCount > 500 {
+		songCount = 500
 	}
+	offset := atoiWithDefault(firstOf(r.Form, "songOffset", "offset"), 0)
+	if offset < 0 {
+		offset = 0
+	}
+
+	// A flat list of every cached track. This is what clients (Feishin's
+	// Songs view, and anything else that paginates the whole library) hit:
+	// they call search3 with a query of "" and page via songOffset/songCount.
+	// Each entry is one cached file — a track, exposed on a track-by-track
+	// basis, not rolled up into albums or artists.
+	cat := s.catalog()
+	var entries []SongEntry
 	if query == "" {
-		resp := okResponse()
-		resp.SearchResult3 = &SearchResult{}
-		write(w, r, resp)
-		return
-	}
-	resp := okResponse()
-	sr := &SearchResult{}
-	seen := make(map[string]bool)
-	// Cached (already-downloaded) matches come first — they play instantly.
-	for _, e := range s.catalog().searchSongs(query) {
-		if len(sr.Songs) >= songCount {
-			break
+		entries = make([]SongEntry, 0, len(cat.songs))
+		for _, cs := range cat.songs {
+			entries = append(entries, cat.entry(cs))
 		}
-		if seen[e.ID] {
-			continue
+	} else {
+		seen := make(map[string]bool)
+		for _, e := range cat.searchSongs(query) { // cached matches first
+			if !seen[e.ID] {
+				seen[e.ID] = true
+				entries = append(entries, e)
+			}
 		}
-		seen[e.ID] = true
-		sr.Songs = append(sr.Songs, e)
-	}
-	if len(sr.Songs) < songCount {
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
 		songs, err := s.meta.Search(ctx, query, songCount)
-		if err != nil && len(sr.Songs) == 0 {
+		if err != nil && len(entries) == 0 {
 			writeFail(w, r, 0, "search failed: "+err.Error())
 			return
 		}
 		for _, m := range songs {
-			if len(sr.Songs) >= songCount {
-				break
-			}
 			e := songToEntry(m)
 			if seen[e.ID] {
 				continue
 			}
 			seen[e.ID] = true
-			sr.Songs = append(sr.Songs, e)
+			entries = append(entries, e)
 		}
 	}
-	resp.SearchResult3 = sr
+
+	if offset > len(entries) {
+		offset = len(entries)
+	}
+	end := offset + songCount
+	if end > len(entries) {
+		end = len(entries)
+	}
+	resp := okResponse()
+	resp.SearchResult3 = &SearchResult{Songs: entries[offset:end]}
+	write(w, r, resp)
+}
+
+// RandomSongs returns every cached track as a flat list (the standard
+// "all songs" endpoint). Ordering is stable so clients can page through it.
+func (s *Server) RandomSongs(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(w, r) {
+		return
+	}
+	_ = r.ParseForm()
+	size := atoiWithDefault(firstOf(r.Form, "size", "count"), 500)
+	if size < 1 {
+		size = 500
+	}
+	if size > 5000 {
+		size = 5000
+	}
+	cat := s.catalog()
+	n := len(cat.songs)
+	if size < n {
+		n = size
+	}
+	songs := make([]SongEntry, 0, n)
+	for _, cs := range cat.songs[:n] {
+		songs = append(songs, cat.entry(cs))
+	}
+	resp := okResponse()
+	resp.RandomSongs = &RandomSongs{Songs: songs}
 	write(w, r, resp)
 }
 

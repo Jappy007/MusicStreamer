@@ -31,15 +31,16 @@ type Response struct {
 	SearchResult3 *SearchResult `xml:"searchResult3,omitempty" json:"searchResult3,omitempty"`
 	Song          *SongEntry    `xml:"song,omitempty" json:"song,omitempty"`
 
-	Playlists  *Playlists     `xml:"playlists,omitempty" json:"playlists,omitempty"`
-	Genres     *Genres        `xml:"genres,omitempty" json:"genres,omitempty"`
-	AlbumList  *AlbumList     `xml:"albumList,omitempty" json:"albumList,omitempty"`
-	AlbumList2 *AlbumList2    `xml:"albumList2,omitempty" json:"albumList2,omitempty"`
-	Album      *AlbumInfo     `xml:"album,omitempty" json:"album,omitempty"`
-	Starred    *Starred       `xml:"starred,omitempty" json:"starred,omitempty"`
-	Starred2   *Starred2      `xml:"starred2,omitempty" json:"starred2,omitempty"`
-	Jukebox    *JukeboxStatus `xml:"jukeboxStatus,omitempty" json:"jukeboxStatus,omitempty"`
-	Artist     *ArtistInfo    `xml:"artist,omitempty" json:"artist,omitempty"`
+	Playlists   *Playlists     `xml:"playlists,omitempty" json:"playlists,omitempty"`
+	Genres      *Genres        `xml:"genres,omitempty" json:"genres,omitempty"`
+	RandomSongs *RandomSongs   `xml:"randomSongs,omitempty" json:"randomSongs,omitempty"`
+	AlbumList   *AlbumList     `xml:"albumList,omitempty" json:"albumList,omitempty"`
+	AlbumList2  *AlbumList2    `xml:"albumList2,omitempty" json:"albumList2,omitempty"`
+	Album       *AlbumInfo     `xml:"album,omitempty" json:"album,omitempty"`
+	Starred     *Starred       `xml:"starred,omitempty" json:"starred,omitempty"`
+	Starred2    *Starred2      `xml:"starred2,omitempty" json:"starred2,omitempty"`
+	Jukebox     *JukeboxStatus `xml:"jukeboxStatus,omitempty" json:"jukeboxStatus,omitempty"`
+	Artist      *ArtistInfo    `xml:"artist,omitempty" json:"artist,omitempty"`
 
 	// Minimal compat stubs so library-browsing clients don't error out.
 	MusicFolders *MusicFolders `xml:"musicFolders,omitempty" json:"musicFolders,omitempty"`
@@ -164,9 +165,15 @@ type Starred2 struct {
 
 type SearchResult struct {
 	XMLName xml.Name      `xml:"searchResult3" json:"-"`
-	Songs   []SongEntry   `xml:"song" json:"song,omitempty"`
+	Songs   []SongEntry   `xml:"song,omitempty" json:"song,omitempty"`
 	Albums  []AlbumEntry  `xml:"album,omitempty" json:"album,omitempty"`
 	Artists []ArtistEntry `xml:"artist,omitempty" json:"artist,omitempty"`
+}
+
+// RandomSongs is the getRandomSongs.view payload: a flat song list.
+type RandomSongs struct {
+	XMLName xml.Name    `xml:"randomSongs" json:"-"`
+	Songs   []SongEntry `xml:"song,omitempty" json:"song,omitempty"`
 }
 
 type SongEntry struct {
