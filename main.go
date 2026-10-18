@@ -1,4 +1,4 @@
-// Command debridsubsonic is an ultra-lightweight Subsonic-compatible music
+// Command MusicStreamer is an ultra-lightweight Subsonic-compatible music
 // server that resolves tracks through the local LRU disk cache and Soulseek
 // (slskd) only — no external indexers, no persistent database.
 //
@@ -17,10 +17,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/debridsubsonic/debridsubsonic/pkg/cache"
-	"github.com/debridsubsonic/debridsubsonic/pkg/metadata"
-	"github.com/debridsubsonic/debridsubsonic/pkg/soulseek"
-	"github.com/debridsubsonic/debridsubsonic/pkg/subsonic"
+	"github.com/musicstreamer/musicstreamer/pkg/cache"
+	"github.com/musicstreamer/musicstreamer/pkg/metadata"
+	"github.com/musicstreamer/musicstreamer/pkg/soulseek"
+	"github.com/musicstreamer/musicstreamer/pkg/subsonic"
 )
 
 // Config is populated from environment variables.
@@ -121,7 +121,7 @@ func main() {
 		_ = httpSrv.Shutdown(ctx)
 	}()
 
-	log.Printf("DebridSubsonic listening on :%s (user=%s)", cfg.Port, cfg.SubsonicUser)
+	log.Printf("MusicStreamer listening on :%s (user=%s)", cfg.Port, cfg.SubsonicUser)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}

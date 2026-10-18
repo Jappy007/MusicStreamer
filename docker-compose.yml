@@ -1,4 +1,4 @@
-# Full stack: DebridSubsonic + slskd (Soulseek).
+# Full stack: MusicStreamer + slskd (Soulseek).
 #
 # Playback sources: the local disk cache (instant) then Soulseek via slskd.
 # No external indexers or AllDebrid account are involved.
@@ -11,10 +11,10 @@
 #   4. Point Feishin/Symfonium at http://<host>:4533.
 
 services:
-  debridsubsonic:
+  musicstreamer:
     build: .
-    image: debridsubsonic:latest
-    container_name: debridsubsonic
+    image: musicstreamer:latest
+    container_name: musicstreamer
     restart: unless-stopped
     depends_on:
       - slskd
@@ -51,7 +51,7 @@ services:
     environment:
       # Primary API key (Administrator role), 16-255 chars. Env-based so it
       # survives recreates — unlike hand-edits to slskd.yml. Must match
-      # SLSKD_API_KEY in .env (used by DebridSubsonic). Generate one and
+      # SLSKD_API_KEY in .env (used by MusicStreamer). Generate one and
       # uncomment (SLSKD_REMOTE_CONFIGURATION is NOT needed for API use):
       # - SLSKD_API_KEY=change-me-to-32-random-characters
       # Soulseek login, first run only (afterwards it lives in slskd.yml —

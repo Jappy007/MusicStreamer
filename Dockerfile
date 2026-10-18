@@ -18,13 +18,13 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -trimpath \
     -ldflags="-s -w -extldflags '-static'" \
-    -o /out/debridsubsonic .
+    -o /out/musicstreamer .
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S app && adduser -S app -G app \
     && mkdir -p /data/cache && chown -R app:app /data
-COPY --from=builder /out/debridsubsonic /usr/local/bin/debridsubsonic
+COPY --from=builder /out/musicstreamer /usr/local/bin/musicstreamer
 # FUSE/audio device access is granted at runtime via --device/--group-add;
 # no extra packages needed for pure HTTP streaming.
 USER app
@@ -33,4 +33,4 @@ EXPOSE 4533
 ENV PORT=4533 CACHE_DIR=/data/cache CACHE_SIZE_GB=10
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD wget -qO- http://127.0.0.1:${PORT:-4533}/healthz || exit 1
-ENTRYPOINT ["debridsubsonic"]
+ENTRYPOINT ["musicstreamer"]

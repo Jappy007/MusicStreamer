@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/debridsubsonic/debridsubsonic/pkg/audioinfo"
-	"github.com/debridsubsonic/debridsubsonic/pkg/cache"
-	"github.com/debridsubsonic/debridsubsonic/pkg/metadata"
-	"github.com/debridsubsonic/debridsubsonic/pkg/soulseek"
+	"github.com/musicstreamer/musicstreamer/pkg/audioinfo"
+	"github.com/musicstreamer/musicstreamer/pkg/cache"
+	"github.com/musicstreamer/musicstreamer/pkg/metadata"
+	"github.com/musicstreamer/musicstreamer/pkg/soulseek"
 )
 
 // Server wires config + collaborators to Subsonic HTTP handlers.
@@ -89,7 +89,7 @@ func (s *Server) License(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.License = &License{Valid: true, Email: "debrid@local", Key: "debridsubsonic", Date: "2030-01-01"}
+	resp.License = &License{Valid: true, Email: "musicstreamer@local", Key: "MusicStreamer", Date: "2030-01-01"}
 	write(w, r, resp)
 }
 

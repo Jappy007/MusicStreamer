@@ -173,7 +173,7 @@ func (c *Client) searchMusicBrainz(ctx context.Context, query string, limit int)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "DebridSubsonic/1.0 (stateless-subsonic)")
+	req.Header.Set("User-Agent", "MusicStreamer/1.0 (stateless-subsonic)")
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err

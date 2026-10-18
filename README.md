@@ -1,4 +1,4 @@
-# DebridSubsonic
+# MusicStreamer
 
 Ultra-lightweight Subsonic-compatible music server (Go 1.22+, stdlib-only,
 <30 MB RAM) that keeps a local disk cache of everything it plays and fills it
@@ -27,7 +27,7 @@ cp .env.example .env   # set SUBSONIC_USER/PASS
 docker compose up --build -d
 ```
 
-This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
+This starts MusicStreamer (`:4533`) plus slskd (`:5030`). Then:
 
 1. Open slskd at `http://<host>:5030` (login `slskd`/`slskd`, change it),
    enter your Soulseek login under Settings. Then set the API key **in

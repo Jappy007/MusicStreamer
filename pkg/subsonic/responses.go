@@ -11,7 +11,7 @@ import (
 const (
 	restVersion   = "1.16.1"
 	serverVersion = "1.0.0"
-	serverType    = "DebridSubsonic"
+	serverType    = "MusicStreamer"
 )
 
 // Response is the top-level Subsonic envelope. It serializes to both the

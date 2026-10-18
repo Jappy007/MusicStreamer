@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/debridsubsonic/debridsubsonic/pkg/audioinfo"
-	"github.com/debridsubsonic/debridsubsonic/pkg/metadata"
+	"github.com/musicstreamer/musicstreamer/pkg/audioinfo"
+	"github.com/musicstreamer/musicstreamer/pkg/metadata"
 )
 
 // cachedSong is a track present in the disk cache, reconstructed from its
