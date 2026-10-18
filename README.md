@@ -1,21 +1,42 @@
 # MusicStreamer
 
 Ultra-lightweight Subsonic-compatible music server (Go 1.22+, stdlib-only,
-<30 MB RAM) that keeps a local disk cache of everything it plays and fills it
-on demand from Soulseek (slskd).
+<30 MB RAM) that keeps a local disk cache of everything it plays, filling it
+on demand from Soulseek (slskd) with an instant YouTube preview while it waits.
 
 Native clients (Symfonium, Feishin) connect as if it were Navidrome/Airsonic.
 
-## Resolution pipeline (`stream.view`, first hit wins)
+## Resolution pipeline (`stream.view`)
 
-1. **Local disk cache** (`CACHE_DIR`, LRU-capped at `CACHE_SIZE_GB`) — served
-   with full `Range` / `206 Partial Content` seeking.
-2. **Soulseek via slskd** — search, download, serve the completed file the
-   instant it lands and promote it into the cache in the background.
+Fresh load (no `Range`, or `bytes=0-`), tried in order:
 
-That's the whole pipeline: cache → Soulseek.
+1. **Full disk cache** (`CACHE_DIR`, LRU-capped at `CACHE_SIZE_GB`) — the
+   lossless/canonical file, served instantly with `Range`/`206` seeking.
+2. **Preview cache / YouTube** — a small lossy m4a (yt-dlp `140`) streams
+   immediately; the canonical file is fetched in the background. Previews live
+   in a separate store (`CACHE_DIR/preview`, `PREVIEW_SIZE_GB`, LRU-evicted)
+   and never appear in the browsable library.
+3. **Soulseek (blocking)** — last resort when no preview can be resolved.
+
+**Background fetch** (one per track): **Soulseek** lossless first, then
+**YouTube best audio** as the canonical file.
+
+### Upgrading a track to lossless
+
+An in-flight stream can't be swapped mid-playback (HTTP range offsets are tied
+to the file), so the upgrade lands on the **next fresh load** of the track:
+restart it, skip away and back, or reopen the app. To keep seeks valid, a
+connection is **pinned to the variant the track started on** for mid-session
+`Range` requests; only a fresh load picks up the lossless file. Pausing and
+pressing play resumes from the client's buffer and does **not** re-contact the
+server, so it keeps the preview until the track is re-opened.
 
 Song IDs are reversible `base64url(artist\x1falbum\x1ftitle)` — stateless, no DB.
+
+> **yt-dlp freshness:** YouTube changes often, so the bundled `yt-dlp` can go
+> stale. Point `YTDLP_PATH` at a newer binary, `pip install -U yt-dlp` in the
+> image, or mount cookies via `YTDLP_COOKIES` if YouTube starts challenging the
+> server. Without a working `yt-dlp`, playback falls back to blocking Soulseek.
 
 ## Quickstart
 
@@ -46,7 +67,7 @@ This starts MusicStreamer (`:4533`) plus slskd (`:5030`). Then:
 | `/rest/search3.view?query=&songCount=&songOffset=` | query empty → flat list of cached tracks (paginated); query set → cached matches first, then Deezer → MusicBrainz |
 | `/rest/getRandomSongs.view?size=` | flat list of every cached track (one entry per file) |
 | `/rest/getSong.view?id=` | decode ID + best-effort enrich |
-| `/rest/stream.view?id=` | cache → Soulseek pipeline |
+| `/rest/stream.view?id=` | cache → YouTube preview → background fetch (see pipeline) |
 | `/rest/getUser.view` | login probe (full stream/playlist roles) |
 | `/rest/getAlbum.view?id=` | cached tracks for the album if present, else metadata-search track list; every song streamable |
 | `/rest/getCoverArt.view?id=` | proxies upstream artwork (any song/album/artist ID) |
@@ -93,4 +114,5 @@ cheap — a file is read at most once.
 - `pkg/metadata/` — Deezer/MusicBrainz → canonical `Song`
 - `pkg/soulseek/` — slskd client (search, queue, presence-based completion, fetch)
 - `pkg/subsonic/` — auth, XML/JSON responses, handlers, router, cache catalog
+- `pkg/ytaudio/` — yt-dlp resolver (direct audio URL for instant playback)
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"github.com/musicstreamer/musicstreamer/pkg/metadata"
 	"github.com/musicstreamer/musicstreamer/pkg/soulseek"
 	"github.com/musicstreamer/musicstreamer/pkg/subsonic"
+	"github.com/musicstreamer/musicstreamer/pkg/ytaudio"
 )
 
 // Config is populated from environment variables.
@@ -29,6 +31,10 @@ type Config struct {
 	SubsonicPass     string
 	CacheDir         string
 	CacheMaxBytes    int64
+	PreviewSizeGB    float64
+	YoutubeEnabled   bool
+	YtDlpBin         string
+	YtDlpCookies     string
 	SlskdURL         string
 	SlskdAPIKey      string
 	SlskdDownloadDir string
@@ -47,11 +53,23 @@ func loadConfig() Config {
 	if cacheGB <= 0 {
 		cacheGB = 10
 	}
+	previewGB, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("PREVIEW_SIZE_GB")), 64)
+	if previewGB <= 0 {
+		previewGB = 2
+	}
+	ytEnabled := true
+	if v := strings.TrimSpace(os.Getenv("YOUTUBE_ENABLED")); v != "" {
+		ytEnabled = !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no"))
+	}
 	return Config{
 		SubsonicUser:     getenv("SUBSONIC_USER", "admin"),
 		SubsonicPass:     getenv("SUBSONIC_PASS", "admin"),
 		CacheDir:         getenv("CACHE_DIR", "/data/cache"),
 		CacheMaxBytes:    int64(cacheGB * 1024 * 1024 * 1024),
+		PreviewSizeGB:    previewGB,
+		YoutubeEnabled:   ytEnabled,
+		YtDlpBin:         getenv("YTDLP_PATH", "yt-dlp"),
+		YtDlpCookies:     strings.TrimSpace(os.Getenv("YTDLP_COOKIES")),
 		SlskdURL:         strings.TrimSpace(os.Getenv("SLSKD_URL")),
 		SlskdAPIKey:      strings.TrimSpace(os.Getenv("SLSKD_API_KEY")),
 		SlskdDownloadDir: strings.TrimSpace(os.Getenv("SLSKD_DOWNLOAD_DIR")),
@@ -78,8 +96,29 @@ func main() {
 	defer close(stopCleaner)
 	go cache.StartCleaner(store, time.Minute, stopCleaner)
 
+	// Preview cache (lossy instant-playback files), separate from the full
+	// cache so previews never appear in the browsable library.
+	preview, err := cache.New(filepath.Join(cfg.CacheDir, "preview"), int64(cfg.PreviewSizeGB*1024*1024*1024))
+	if err != nil {
+		log.Fatalf("preview cache init: %v", err)
+	}
+	go cache.StartCleaner(preview, time.Minute, stopCleaner)
+
 	// Metadata is used only for library browsing/search (Deezer/MusicBrainz).
 	meta := metadata.New(nil)
+
+	// Instant-playback previews via yt-dlp (on by default; needs yt-dlp on PATH).
+	var yt *ytaudio.Client
+	if cfg.YoutubeEnabled {
+		yt = ytaudio.New(cfg.YtDlpBin, cfg.YtDlpCookies)
+		if yt.Enabled() {
+			log.Printf("youtube: enabled via %s (preview budget %.1fGiB, cookies=%v)", cfg.YtDlpBin, cfg.PreviewSizeGB, cfg.YtDlpCookies != "")
+		} else {
+			log.Printf("youtube: %s not found on PATH - instant playback disabled", cfg.YtDlpBin)
+		}
+	} else {
+		log.Println("youtube: disabled (YOUTUBE_ENABLED=false)")
+	}
 
 	// Tier 3: Soulseek direct via slskd — the fetch source. Disabled when
 	// SLSKD_URL is unset (cache-only server).
@@ -95,7 +134,7 @@ func main() {
 		log.Println("soulseek: disabled; set SLSKD_URL to enable")
 	}
 
-	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, store, nil)
+	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, yt, store, preview, nil)
 
 	mux := http.NewServeMux()
 	subsonic.Route(mux, srv)

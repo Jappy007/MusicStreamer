@@ -1,7 +1,8 @@
 # Full stack: MusicStreamer + slskd (Soulseek).
 #
-# Playback sources: the local disk cache (instant) then Soulseek via slskd.
-# No external indexers or AllDebrid account are involved.
+# Playback: full disk cache (instant) -> YouTube preview + background fetch
+# (Soulseek lossless first, then YouTube best audio). No external indexers or
+# AllDebrid account are involved.
 #
 # Usage:
 #   1. cp .env.example .env
@@ -25,6 +26,15 @@ services:
       SUBSONIC_PASS: ${SUBSONIC_PASS:-admin}
       CACHE_SIZE_GB: ${CACHE_SIZE_GB:-10}
       CACHE_DIR: /data/cache
+      # Instant playback: a low-bitrate YouTube preview streams immediately
+      # while the lossless file is fetched in the background. On by default;
+      # requires yt-dlp (bundled in the image).
+      YOUTUBE_ENABLED: ${YOUTUBE_ENABLED:-true}
+      PREVIEW_SIZE_GB: ${PREVIEW_SIZE_GB:-2}
+      YTDLP_PATH: ${YTDLP_PATH:-yt-dlp}
+      # Optional cookies file (YouTube bot-check escape hatch); mount it and
+      # set YTDLP_COOKIES=/data/cookies.txt.
+      YTDLP_COOKIES: ${YTDLP_COOKIES:-}
       # Soulseek: slskd's address (service name) and downloads. The downloads
       # volume is mounted at slskd's own container default (/app/downloads),
       # so leave SLSKD_DOWNLOAD_DIR empty unless slskd uses a custom dir
@@ -36,6 +46,8 @@ services:
     volumes:
       - cache:/data/cache
       - slskd-downloads:/app/downloads:ro
+      # Optional: cookies for yt-dlp, then set YTDLP_COOKIES=/data/cookies.txt
+      # - ./cookies.txt:/data/cookies.txt:ro
     # Uncomment for FUSE/audio device passthrough if ever needed:
     # devices:
     #   - /dev/snd:/dev/snd

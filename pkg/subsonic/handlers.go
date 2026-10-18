@@ -16,6 +16,7 @@ import (
 	"github.com/musicstreamer/musicstreamer/pkg/cache"
 	"github.com/musicstreamer/musicstreamer/pkg/metadata"
 	"github.com/musicstreamer/musicstreamer/pkg/soulseek"
+	"github.com/musicstreamer/musicstreamer/pkg/ytaudio"
 )
 
 // Server wires config + collaborators to Subsonic HTTP handlers.
@@ -24,14 +25,21 @@ type Server struct {
 	pass     string
 	meta     *metadata.Client
 	soulseek *soulseek.Client
+	yt       *ytaudio.Client
 	storage  *cache.Manager
+	preview  *cache.Manager
 
-	// proxy performs upstream GETs (cover art). No client-level Timeout:
-	// the request context governs each fetch.
+	// proxy performs upstream GETs (cover art, YouTube audio previews). No
+	// client-level Timeout: the request context governs each fetch.
 	proxy *http.Client
 
-	mu       sync.Mutex
-	inflight map[string]struct{} // song IDs currently being resolved/fetched
+	// fetchFlight coalesces background canonical fetches (one per song id).
+	fetchFlight flight
+
+	// pins remembers, per client connection, which file variant a track's
+	// playback began on, so seeks stay byte-consistent (see singleflight.go).
+	pinMu sync.Mutex
+	pins  map[string]pinEntry
 
 	// info memoizes probed audio properties (format/sample rate/bit depth)
 	// per cached song id; size invalidates the entry on re-download.
@@ -47,8 +55,9 @@ type infoCache struct {
 }
 
 // NewServer builds a handler set. proxy may be nil (a default is used).
-// sk may be nil (disables Soulseek fetching).
-func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, s *cache.Manager, proxy *http.Client) *Server {
+// sk and yt may be nil (disables the Soulseek and YouTube preview sources).
+// preview may be nil (disables lossy instant-playback caching).
+func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *ytaudio.Client, s *cache.Manager, preview *cache.Manager, proxy *http.Client) *Server {
 	if proxy == nil {
 		proxy = &http.Client{
 			Transport: &http.Transport{
@@ -60,8 +69,8 @@ func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, s *ca
 	}
 	return &Server{
 		user: user, pass: pass,
-		meta: m, soulseek: sk, storage: s,
-		proxy: proxy, inflight: make(map[string]struct{}),
+		meta: m, soulseek: sk, yt: yt, storage: s, preview: preview,
+		proxy: proxy,
 	}
 }
 
@@ -584,10 +593,20 @@ func (s *Server) GetSong(w http.ResponseWriter, r *http.Request) {
 // --- stream: cache -> Soulseek pipeline -----------------------------------
 
 // Stream implements GET /rest/stream.view?id=... Two sources, tried in
-// order until one serves audio:
+// Stream implements GET /rest/stream.view?id=...
 //
-// Tier 1: local disk cache (instant, Range-capable).
-// Tier 3: Soulseek direct via slskd (music-native, often fastest).
+// Sources, in order:
+//
+//   - Full disk cache (lossless/canonical): instant, Range-capable. Only
+//     served for a *fresh* media load (no Range, or bytes=0-), because
+//     switching files mid-playback would invalidate the client's byte offsets.
+//   - Preview disk cache / YouTube preview: a small lossy m4a served instantly
+//     while the full file is fetched in the background.
+//   - Soulseek (blocking): the last resort when no preview can be resolved.
+//
+// A background fetch (Soulseek lossless first, then YouTube best-audio) fills
+// the full cache; the next time the track is loaded it is served lossless.
+// Mid-session Range requests stay pinned to the variant the track started on.
 func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(w, r) {
 		return
@@ -604,37 +623,75 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Tier 1: local disk cache. ServeFile/ServeContent handles
-	// `Range: bytes=..` -> 206 Partial Content for seeking.
-	if path, ok := s.storage.Lookup(id); ok {
-		log.Printf("stream: %q - %q: tier=cache", artist, title)
-		s.serveCached(w, r, path)
-		return
-	}
+	fresh := rangeIsFresh(r)
 
-	// Dedupe thundering herds: one resolution per song at a time.
-	if !s.claim(id) {
-		// Another goroutine is fetching (a slow Soulseek download). Wait
-		// for the cache to fill — the fetch writes it there on success —
-		// bounded by the client's own request context.
-		if s.waitForCache(r.Context(), id, 10*time.Minute) {
+	if fresh {
+		// Tier 1: full cache. A fresh load always re-reads the header, so it is
+		// safe to switch from a preview to the lossless file here.
+		if path, ok := s.storage.Lookup(id); ok {
+			log.Printf("stream: %q - %q: tier=cache", artist, title)
+			s.pin(r.RemoteAddr, id, variantFull)
+			s.serveCached(w, r, path)
+			return
+		}
+	} else {
+		// Mid-session Range (seek): keep serving the variant this playback
+		// began with so byte offsets remain valid.
+		switch s.pinnedVariant(r.RemoteAddr, id) {
+		case variantFull:
 			if path, ok := s.storage.Lookup(id); ok {
 				s.serveCached(w, r, path)
 				return
 			}
+		case variantPreview:
+			if s.preview != nil {
+				if path, ok := s.preview.Lookup(id); ok {
+					s.serveCached(w, r, path)
+					return
+				}
+			}
 		}
-		writeFail(w, r, 0, "Track is being fetched, retry shortly")
-		return
+		// Unknown/expired pin: best available (a rare offset reset).
+		if path, ok := s.storage.Lookup(id); ok {
+			s.pin(r.RemoteAddr, id, variantFull)
+			s.serveCached(w, r, path)
+			return
+		}
 	}
-	defer s.release(id)
 
-	// Tier 3: Soulseek direct (music-native network, often fastest for
-	// audio). Needs slskd configured (SLSKD_URL/SLSKD_DOWNLOAD_DIR).
+	// Tier 2: cached preview (lossy, instant).
+	if s.preview != nil {
+		if path, ok := s.preview.Lookup(id); ok {
+			log.Printf("stream: %q - %q: tier=preview-cache", artist, title)
+			s.pin(r.RemoteAddr, id, variantPreview)
+			s.serveCached(w, r, path)
+			go s.startFullFetch(id, artist, album, title)
+			return
+		}
+	}
+
+	// Tier 3: resolve a fresh YouTube preview and stream it now.
+	if s.yt != nil && s.yt.Enabled() {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		st, rerr := s.yt.Resolve(ctx, artist, title, false)
+		cancel()
+		if rerr == nil {
+			log.Printf("stream: %q - %q: tier=youtube preview", artist, title)
+			s.pin(r.RemoteAddr, id, variantPreview)
+			s.servePreview(w, r, id, st)
+			go s.startFullFetch(id, artist, album, title)
+			return
+		}
+		log.Printf("stream: %q - %q: youtube resolve failed: %v", artist, title, rerr)
+	}
+
+	// Tier 4: blocking Soulseek — no preview available.
 	if s.soulseek != nil && s.soulseek.Enabled() {
-		if path, err := s.soulseek.FetchTrackShared(r.Context(), artist, album, title); err != nil {
-			log.Printf("stream: %q - %q: soulseek failed: %v", artist, title, err)
+		if path, serr := s.soulseek.FetchTrackShared(r.Context(), artist, album, title); serr != nil {
+			log.Printf("stream: %q - %q: soulseek failed: %v", artist, title, serr)
 		} else {
 			log.Printf("stream: %q - %q: tier=soulseek", artist, title)
+			s.pin(r.RemoteAddr, id, variantFull)
 			s.serveSoulseek(w, r, id, path)
 			return
 		}
@@ -643,10 +700,134 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	writeFail(w, r, 70, "No source for \""+artist+" - "+title+"\"")
 }
 
-// and promotes it into the disk cache in the background. Serving first means
-// playback starts immediately; the background copy (atomic tmp+rename) makes
-// later plays, concurrent clients and Range seeks converge on a stable cache
-// entry even if slskd later prunes the download.
+// servePreview proxies a resolved YouTube audio URL to the client, preserving
+// Range/seek semantics. On a full (200) response it also spills the bytes to a
+// temp file and commits them to the preview cache, so replays start instantly.
+func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string, st ytaudio.Stream) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, st.URL, nil)
+	if err != nil {
+		writeFail(w, r, 0, "Stream unavailable")
+		return
+	}
+	if rng := r.Header.Get("Range"); rng != "" {
+		req.Header.Set("Range", rng)
+	}
+	req.Header.Set("User-Agent", "MusicStreamer/1.0")
+	resp, err := s.proxy.Do(req)
+	if err != nil {
+		log.Printf("stream: preview %s: %v", id, err)
+		writeFail(w, r, 0, "Stream unavailable")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		writeFail(w, r, 0, "Stream unavailable")
+		return
+	}
+
+	ctype := st.ContentType
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		ctype = ct
+	}
+	if ctype == "" || strings.HasPrefix(ctype, "text/") {
+		ctype = "audio/mp4"
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Accept-Ranges", "bytes")
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Range request (seek): pure proxy, never cache a partial file.
+	if resp.StatusCode == http.StatusPartialContent || s.preview == nil {
+		_, _ = io.CopyBuffer(w, resp.Body, make([]byte, 32<<10))
+		return
+	}
+
+	// Full GET: stream to the client while spilling to a temp file; commit to
+	// the preview cache only on a clean EOF (no partial files).
+	tmp, err := os.CreateTemp(s.preview.Dir(), id+".*.tmp")
+	if err != nil {
+		_, _ = io.CopyBuffer(w, resp.Body, make([]byte, 32<<10))
+		return
+	}
+	tmpPath := tmp.Name()
+	tee := io.TeeReader(resp.Body, tmp)
+	_, copyErr := io.CopyBuffer(w, tee, make([]byte, 32<<10))
+	syncErr := tmp.Sync()
+	closeErr := tmp.Close()
+	if copyErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := s.preview.CommitTemp(id, tmpPath); err != nil {
+		log.Printf("stream: preview cache store %s: %v", id, err)
+	}
+}
+
+// startFullFetch fetches the canonical (lossless-preferred) file into the full
+// cache in the background, once per song id. Soulseek is tried first; when it
+// yields nothing, YouTube's best audio is cached instead. The preview entry is
+// left in place (it ages out via the preview LRU).
+func (s *Server) startFullFetch(id, artist, album, title string) {
+	if !s.fetchFlight.begin(id) {
+		return // already being fetched
+	}
+	defer s.fetchFlight.finish(id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+
+	// Preferred: Soulseek (FLAC when available).
+	if s.soulseek != nil && s.soulseek.Enabled() {
+		path, err := s.soulseek.FetchTrackShared(ctx, artist, album, title)
+		if err != nil {
+			log.Printf("fetch: %q - %q: soulseek failed: %v", artist, title, err)
+		} else if f, oerr := os.Open(path); oerr == nil {
+			serr := s.storage.Store(id, f)
+			f.Close()
+			if serr == nil {
+				log.Printf("fetch: %q - %q: cached (soulseek)", artist, title)
+				return
+			}
+			log.Printf("fetch: %q - %q: store: %v", artist, title, serr)
+		}
+	}
+
+	// Fallback: YouTube best audio as the canonical file.
+	if s.yt != nil && s.yt.Enabled() {
+		st, err := s.yt.Resolve(ctx, artist, title, true)
+		if err != nil {
+			log.Printf("fetch: %q - %q: youtube resolve failed: %v", artist, title, err)
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, st.URL, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", "MusicStreamer/1.0")
+		resp, err := s.proxy.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			return
+		}
+		defer resp.Body.Close()
+		if err := s.storage.Store(id, io.LimitReader(resp.Body, 512<<20)); err != nil {
+			log.Printf("fetch: %q - %q: youtube store: %v", artist, title, err)
+			return
+		}
+		log.Printf("fetch: %q - %q: cached (youtube best audio)", artist, title)
+	}
+}
+
+// serveSoulseek serves a completed Soulseek file immediately and promotes it
+// into the full disk cache in the background.
 func (s *Server) serveSoulseek(w http.ResponseWriter, r *http.Request, id, path string) {
 	if f, err := os.Open(path); err == nil {
 		go func() {
@@ -687,43 +868,35 @@ func (s *Server) serveCached(w http.ResponseWriter, r *http.Request, path string
 	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 }
 
-// claim/inflight helpers -----------------------------------------------
-
-func (s *Server) claim(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.inflight[id]; ok {
-		return false
+// rangeIsFresh reports whether the request is the start of a new media load:
+// no Range header, or a range beginning at byte 0. A prefix range that starts
+// at 0 re-reads the header, so switching files on it is safe; any other range
+// (bytes=N-, N>0, or a suffix range) continues an existing load.
+func rangeIsFresh(r *http.Request) bool {
+	spec := strings.TrimSpace(r.Header.Get("Range"))
+	if spec == "" {
+		return true
 	}
-	s.inflight[id] = struct{}{}
-	return true
-}
-
-func (s *Server) release(id string) {
-	s.mu.Lock()
-	delete(s.inflight, id)
-	s.mu.Unlock()
-}
-
-func (s *Server) waitForCache(ctx context.Context, id string, max time.Duration) bool {
-	deadline := time.Now().Add(max)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(500 * time.Millisecond):
-		}
-		if _, ok := s.storage.Lookup(id); ok {
-			return true
-		}
-		s.mu.Lock()
-		_, busy := s.inflight[id]
-		s.mu.Unlock()
-		if !busy {
-			return false
-		}
+	if !strings.HasPrefix(spec, "bytes=") {
+		return true
 	}
-	return false
+	spec = strings.TrimPrefix(spec, "bytes=")
+	if i := strings.IndexByte(spec, ','); i >= 0 {
+		spec = spec[:i] // first range only
+	}
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return true
+	}
+	start := strings.TrimSpace(spec[:dash])
+	if start == "" {
+		return false // suffix range (bytes=-N): tail of an existing load
+	}
+	n, err := strconv.ParseInt(start, 10, 64)
+	if err != nil {
+		return true
+	}
+	return n <= 0
 }
 
 // --- helpers ------------------------------------------------------------
