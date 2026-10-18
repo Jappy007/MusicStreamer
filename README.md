@@ -1,45 +1,29 @@
 # DebridSubsonic
 
 Ultra-lightweight Subsonic-compatible music server (Go 1.22+, stdlib-only,
-<30 MB RAM) fronting AllDebrid as a cloud music locker.
+<30 MB RAM) that keeps a local disk cache of everything it plays and fills it
+on demand from Soulseek (slskd).
 
 Native clients (Symfonium, Feishin) connect as if it were Navidrome/Airsonic.
 
 ## Resolution pipeline (`stream.view`, first hit wins)
 
-0. **Local library** (`MUSIC_DIR`, e.g. Lidarr's output) — files Lidarr
-   already downloaded play instantly, no cloud involved.
 1. **Local disk cache** (`CACHE_DIR`, LRU-capped at `CACHE_SIZE_GB`) — served
    with full `Range` / `206 Partial Content` seeking.
-2. **AllDebrid cloud** — `POST /v4.1/magnet/status` fuzzy-matches the album
-   container, one batched `POST /v4/magnet/files` call resolves file trees,
-   `POST /v4/link/unlock`, proxies bytes while Tee-spilling to cache.
-   (Bearer auth; the legacy `GET /v4/magnet/status` is discontinued upstream.)
-3. **Soulseek via slskd** when configured (music-native, often fastest for
-   audio) — search, download, serve from the shared download dir.
-4. **Debrid scrape, last resort** — Prowlarr, then the built-in public DHT
-   index, each fully resolved (search → upload → Ready) before the next
-   is tried, so one dead source never blocks the others.
-   `magnet:` URIs go to `POST /v4/magnet/upload`; index `.torrent` links are
-   fetched locally (they're LAN-only/key-gated) and pushed to
-   `POST /v4/magnet/upload/file`. Then poll to `Ready`, unlock, proxy + cache.
-   Album releases are preferred throughout: track IDs naming a single release
-   are resolved to every plausible album first (ID album unless single-like,
-   plus distinct lookup albums), each tried cleaned + FLAC; candidates named
-   like the album outrank single-track rips (one upload then serves every
-   track via the cloud tier).
-   Candidates are tried seeder-desc (Prowlarr rows below `MIN_SEEDERS` are
-   skipped when set); a torrent AllDebrid reports with zero activity aborts
-   early (~20s with no seeders, ~48s otherwise) so a dead swarm can't burn
-   the full wait budget before the next candidate is tried.
-   (AllDebrid has no search API — it can only download magnets an index found.)
+2. **Soulseek via slskd** — search, download, serve the completed file the
+   instant it lands and promote it into the cache in the background.
+
+That's the whole pipeline: cache → Soulseek. No AllDebrid account, no external
+indexers, no scrape tier. A track that is already cached is instant; a track
+that is not is fetched from Soulseek and cached for next time. Concurrent
+requests for the same track share one fetch (the others wait on the cache).
 
 Song IDs are reversible `base64url(artist\x1falbum\x1ftitle)` — stateless, no DB.
 
 ## Quickstart
 
 ```bash
-cp .env.example .env   # fill ALLDEBRID_API_KEY, SUBSONIC_USER/PASS
+cp .env.example .env   # set SUBSONIC_USER/PASS
 docker compose up --build -d
 ```
 
@@ -51,13 +35,10 @@ This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
    16+ chars), copy the same value to `SLSKD_API_KEY` in `.env`, and
    `docker compose up -d` again. Key-in-compose survives recreates;
    hand-edits to slskd.yml inside the container do not (and
-   `SLSKD_REMOTE_CONFIGURATION` is not needed for API use). No Soulseek
-   login = Soulseek tier stays idle; everything else works.
+    `SLSKD_REMOTE_CONFIGURATION` is not needed for API use). Without a
+    Soulseek login nothing can be fetched — only already-cached tracks play.
 2. Point Symfonium/Feishin at `http://<host>:4533`, user/pass from env,
-   `?f=json` is honored automatically.
-3. Optional: uncomment the `prowlarr`/`lidarr` services in
-   `docker-compose.yml` if you want them in this stack, or keep your
-   existing instances and just set `PROWLARR_URL`/`PROWLARR_API_KEY`.
+    `?f=json` is honored automatically.
 
 ## Endpoints
 
@@ -68,7 +49,7 @@ This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
 | `/rest/search3.view?query=&songCount=&songOffset=` | query empty → flat list of cached tracks (paginated); query set → cached matches first, then Deezer → MusicBrainz |
 | `/rest/getRandomSongs.view?size=` | flat list of every cached track (one entry per file) |
 | `/rest/getSong.view?id=` | decode ID + best-effort enrich |
-| `/rest/stream.view?id=` | 3-tier pipeline |
+| `/rest/stream.view?id=` | cache → Soulseek pipeline |
 | `/rest/getUser.view` | login probe (full stream/playlist roles) |
 | `/rest/getAlbum.view?id=` | cached tracks for the album if present, else metadata-search track list; every song streamable |
 | `/rest/getCoverArt.view?id=` | proxies upstream artwork (any song/album/artist ID) |
@@ -79,7 +60,7 @@ This starts DebridSubsonic (`:4533`) plus slskd (`:5030`). Then:
 | `/rest/getMusicFolders`, `/rest/getOpenSubsonicExtensions` | compat stubs |
 | `/rest/getIndexes`, `/rest/getArtists` | artists present in the disk cache |
 | `/rest/getAlbumList` | same as `getAlbumList2` (cache-backed) |
-| `/rest/getPlaylists`, `/rest/getGenres`, `/rest/getStarred`, `/rest/getStarred2` | empty-library stubs (no persistent library; tracks resolve via search+debrid) |
+| `/rest/getPlaylists`, `/rest/getGenres`, `/rest/getStarred`, `/rest/getStarred2` | empty-library stubs (no persistent library; tracks resolve via cache + Soulseek) |
 | `/healthz` | container healthcheck |
 
 Auth: `t`/`s` token, `p` plaintext, `p=enc:<hex>` all accepted.
@@ -112,7 +93,9 @@ cheap — a file is read at most once.
 - `main.go` — env config, cache + cleaner, HTTP server, graceful shutdown
 - `pkg/audioinfo/` — header-only audio format / sample-rate / bit-depth sniffing
 - `pkg/cache/` — RWMutex-guarded LRU, atomic tmp→rename writes, background purge
-- `pkg/debrid/` — AllDebrid v4 client (context timeouts) + Prowlarr search
 - `pkg/metadata/` — Deezer/MusicBrainz → canonical `Song`
-- `pkg/subsonic/` — auth, XML/JSON responses, handlers, router
+- `pkg/soulseek/` — slskd client (search, queue, presence-based completion, fetch)
+- `pkg/subsonic/` — auth, XML/JSON responses, handlers, router, cache catalog
+- `pkg/debrid/`, `pkg/library/` — legacy AllDebrid/Prowlarr and local-library
+  code kept for reference; no longer wired into the server
 

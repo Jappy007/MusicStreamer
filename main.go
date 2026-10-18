@@ -1,6 +1,6 @@
 // Command debridsubsonic is an ultra-lightweight Subsonic-compatible music
-// server that resolves tracks via local LRU disk cache -> AllDebrid cloud ->
-// Prowlarr scrape + AllDebrid upload.
+// server that resolves tracks through the local LRU disk cache and Soulseek
+// (slskd) only — no external indexers, no persistent database.
 //
 // Tiny static binary, <30 MB RAM: stdlib-only, streaming I/O throughout,
 // O(files) cache index, no DB, no in-memory audio buffering.
@@ -18,8 +18,6 @@ import (
 	"time"
 
 	"github.com/debridsubsonic/debridsubsonic/pkg/cache"
-	"github.com/debridsubsonic/debridsubsonic/pkg/debrid"
-	"github.com/debridsubsonic/debridsubsonic/pkg/library"
 	"github.com/debridsubsonic/debridsubsonic/pkg/metadata"
 	"github.com/debridsubsonic/debridsubsonic/pkg/soulseek"
 	"github.com/debridsubsonic/debridsubsonic/pkg/subsonic"
@@ -27,14 +25,10 @@ import (
 
 // Config is populated from environment variables.
 type Config struct {
-	AllDebridAPIKey  string
 	SubsonicUser     string
 	SubsonicPass     string
 	CacheDir         string
 	CacheMaxBytes    int64
-	ProwlarrURL      string
-	ProwlarrAPIKey   string
-	MinSeeders       int
 	SlskdURL         string
 	SlskdAPIKey      string
 	SlskdDownloadDir string
@@ -53,19 +47,11 @@ func loadConfig() Config {
 	if cacheGB <= 0 {
 		cacheGB = 10
 	}
-	minSeeders, _ := strconv.Atoi(strings.TrimSpace(os.Getenv("MIN_SEEDERS")))
-	if minSeeders < 0 {
-		minSeeders = 0
-	}
 	return Config{
-		AllDebridAPIKey:  strings.TrimSpace(os.Getenv("ALLDEBRID_API_KEY")),
 		SubsonicUser:     getenv("SUBSONIC_USER", "admin"),
 		SubsonicPass:     getenv("SUBSONIC_PASS", "admin"),
 		CacheDir:         getenv("CACHE_DIR", "/data/cache"),
 		CacheMaxBytes:    int64(cacheGB * 1024 * 1024 * 1024),
-		ProwlarrURL:      strings.TrimSpace(os.Getenv("PROWLARR_URL")),
-		ProwlarrAPIKey:   strings.TrimSpace(os.Getenv("PROWLARR_API_KEY")),
-		MinSeeders:       minSeeders,
 		SlskdURL:         strings.TrimSpace(os.Getenv("SLSKD_URL")),
 		SlskdAPIKey:      strings.TrimSpace(os.Getenv("SLSKD_API_KEY")),
 		SlskdDownloadDir: strings.TrimSpace(os.Getenv("SLSKD_DOWNLOAD_DIR")),
@@ -76,10 +62,6 @@ func loadConfig() Config {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	cfg := loadConfig()
-
-	if cfg.AllDebridAPIKey == "" {
-		log.Println("WARN: ALLDEBRID_API_KEY is empty; Tier 2/3 streaming will fail until set")
-	}
 
 	// LRU disk cache (Tier 1).
 	store, err := cache.New(cfg.CacheDir, cfg.CacheMaxBytes)
@@ -96,17 +78,11 @@ func main() {
 	defer close(stopCleaner)
 	go cache.StartCleaner(store, time.Minute, stopCleaner)
 
-	// Collaborators.
+	// Metadata is used only for library browsing/search (Deezer/MusicBrainz).
 	meta := metadata.New(nil)
-	ad := debrid.New(cfg.AllDebridAPIKey, nil)
-	indexer := debrid.NewProwlarr(cfg.ProwlarrURL, cfg.ProwlarrAPIKey, nil)
-	indexer.MinSeeders = cfg.MinSeeders
-	if indexer.Enabled() {
-		log.Printf("prowlarr: enabled (%s, min_seeders=%d)", cfg.ProwlarrURL, cfg.MinSeeders)
-	} else {
-		log.Println("prowlarr: disabled; Tier 3 falls back to built-in public indexes")
-	}
-	public := debrid.NewPublicIndex(nil)
+
+	// Tier 3: Soulseek direct via slskd — the fetch source. Disabled when
+	// SLSKD_URL is unset (cache-only server).
 	sk := soulseek.New(cfg.SlskdURL, cfg.SlskdAPIKey, cfg.SlskdDownloadDir, nil)
 	if sk.Enabled() {
 		if fi, err := os.Stat(sk.DownloadDir()); err != nil || !fi.IsDir() {
@@ -118,38 +94,8 @@ func main() {
 	} else {
 		log.Println("soulseek: disabled; set SLSKD_URL to enable")
 	}
-	// Index download links are served by Prowlarr itself (LAN-only,
-	// key-gated): fetch them here so AllDebrid receives real .torrent bytes.
-	ad.TorrentFetch = func(ctx context.Context, rawURL string) (debrid.FetchedTorrent, error) {
-		return indexer.FetchDownload(ctx, rawURL)
-	}
 
-	// Local music library (Tier 0): plays Lidarr's completed downloads
-	// straight from disk. Empty/unset MUSIC_DIR disables the tier.
-	var lib *library.Library
-	if dir := strings.TrimSpace(os.Getenv("MUSIC_DIR")); dir != "" {
-		lib, err = library.New(dir)
-		if err != nil {
-			log.Fatalf("library init: %v", err)
-		}
-		log.Printf("library: dir=%s files=%d", dir, lib.Stats())
-		go func() {
-			t := time.NewTicker(5 * time.Minute)
-			defer t.Stop()
-			for {
-				select {
-				case <-stopCleaner:
-					return
-				case <-t.C:
-					if err := lib.Scan(); err != nil {
-						log.Printf("library rescan: %v", err)
-					}
-				}
-			}
-		}()
-	}
-
-	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, ad, indexer, public, sk, lib, store, nil)
+	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, store, nil)
 
 	mux := http.NewServeMux()
 	subsonic.Route(mux, srv)

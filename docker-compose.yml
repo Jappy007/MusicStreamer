@@ -1,12 +1,13 @@
 # Full stack: DebridSubsonic + slskd (Soulseek).
-# Prowlarr/Lidarr templates are included commented out — you already host
-# those, so only uncomment if you want them in this stack too.
+#
+# Playback sources: the local disk cache (instant) then Soulseek via slskd.
+# No external indexers or AllDebrid account are involved.
 #
 # Usage:
-#   1. cp .env.example .env   (then fill in ALLDEBRID_API_KEY etc.)
+#   1. cp .env.example .env
 #   2. docker compose up --build -d
 #   3. Open slskd at http://<host>:5030, enter your Soulseek login
-#      (Settings) so the Soulseek tier can search/download.
+#      (Settings) so tracks can be searched/downloaded.
 #   4. Point Feishin/Symfonium at http://<host>:4533.
 
 services:
@@ -20,15 +21,10 @@ services:
     ports:
       - "${PORT:-4533}:4533"
     environment:
-      ALLDEBRID_API_KEY: "${ALLDEBRID_API_KEY:?set your AllDebrid API key in .env}"
       SUBSONIC_USER: ${SUBSONIC_USER:-admin}
       SUBSONIC_PASS: ${SUBSONIC_PASS:-admin}
       CACHE_SIZE_GB: ${CACHE_SIZE_GB:-10}
       CACHE_DIR: /data/cache
-      PROWLARR_URL: ${PROWLARR_URL:-}
-      PROWLARR_API_KEY: ${PROWLARR_API_KEY:-}
-      MIN_SEEDERS: ${MIN_SEEDERS:-0}
-      MUSIC_DIR: ${MUSIC_DIR:-}
       # Soulseek: slskd's address (service name) and downloads. The downloads
       # volume is mounted at slskd's own container default (/app/downloads),
       # so leave SLSKD_DOWNLOAD_DIR empty unless slskd uses a custom dir
@@ -40,9 +36,6 @@ services:
     volumes:
       - cache:/data/cache
       - slskd-downloads:/app/downloads:ro
-      # Optional Tier 0: Lidarr's output, played instantly from disk.
-      # Uncomment and set MUSIC_DIR=/music in .env:
-      # - /path/to/music:/music:ro
     # Uncomment for FUSE/audio device passthrough if ever needed:
     # devices:
     #   - /dev/snd:/dev/snd
@@ -74,35 +67,6 @@ services:
     # For best Soulseek speeds, also forward your Soulseek listening port
     # (see the port in slskd Settings, default 50300) on your router to this host.
 
-  # Optional: run Prowlarr in this stack (skip if you already host it —
-  # just set PROWLARR_URL/PROWLARR_API_KEY in .env to your instance).
-  # prowlarr:
-  #   image: lscr.io/linuxserver/prowlarr:latest
-  #   container_name: prowlarr
-  #   restart: unless-stopped
-  #   ports:
-  #     - "9696:9696"
-  #   environment:
-  #     PUID: "1000"
-  #     PGID: "1000"
-  #   volumes:
-  #     - prowlarr-config:/config
-
-  # Optional: run Lidarr in this stack (skip if you already host it).
-  # lidarr:
-  #   image: lscr.io/linuxserver/lidarr:latest
-  #   container_name: lidarr
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8686:8686"
-  #   environment:
-  #     PUID: "1000"
-  #     PGID: "1000"
-  #   volumes:
-  #     - lidarr-config:/config
-  #     - /path/to/music:/music
-  #     - /path/to/downloads:/downloads
-
 volumes:
   cache:
     driver: local
@@ -110,7 +74,3 @@ volumes:
     driver: local
   slskd-downloads:
     driver: local
-  # prowlarr-config:
-  #   driver: local
-  # lidarr-config:
-  #   driver: local
