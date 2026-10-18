@@ -96,6 +96,4 @@ cheap — a file is read at most once.
 - `pkg/metadata/` — Deezer/MusicBrainz → canonical `Song`
 - `pkg/soulseek/` — slskd client (search, queue, presence-based completion, fetch)
 - `pkg/subsonic/` — auth, XML/JSON responses, handlers, router, cache catalog
-- `pkg/debrid/`, `pkg/library/` — legacy AllDebrid/Prowlarr and local-library
-  code kept for reference; no longer wired into the server
 
