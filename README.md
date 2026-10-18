@@ -13,10 +13,7 @@ Native clients (Symfonium, Feishin) connect as if it were Navidrome/Airsonic.
 2. **Soulseek via slskd** — search, download, serve the completed file the
    instant it lands and promote it into the cache in the background.
 
-That's the whole pipeline: cache → Soulseek. No AllDebrid account, no external
-indexers, no scrape tier. A track that is already cached is instant; a track
-that is not is fetched from Soulseek and cached for next time. Concurrent
-requests for the same track share one fetch (the others wait on the cache).
+That's the whole pipeline: cache → Soulseek.
 
 Song IDs are reversible `base64url(artist\x1falbum\x1ftitle)` — stateless, no DB.
 
