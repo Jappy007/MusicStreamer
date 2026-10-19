@@ -99,10 +99,10 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// warmURL is a stable, always-available video used only to pay yt-dlp's
+// warmURL is a stable, always-available music video used only to pay yt-dlp's
 // one-time cold-start cost (loading the JS runtime and its EJS challenge
 // solver) before a user request needs it.
-const warmURL = "https://www.youtube.com/watch?v=BaW_jenozKc"
+const warmURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 // Warm runs one throwaway resolve to populate the runtime/EJS caches so the
 // first real request is fast. Safe to call in the background.
@@ -116,7 +116,10 @@ func (c *Client) Warm(ctx context.Context) error {
 	}
 	args = append(args, c.extraArgs...)
 	args = append(args, warmURL)
-	return exec.CommandContext(ctx, c.bin, args...).Run()
+	if _, err := exec.CommandContext(ctx, c.bin, args...).Output(); err != nil {
+		return fmt.Errorf("%w%s", err, failureDetail(ctx, err))
+	}
+	return nil
 }
 
 // Resolve searches YouTube for "artist title" and returns a direct audio URL.
