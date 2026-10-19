@@ -31,6 +31,9 @@ services:
       # requires yt-dlp (bundled in the image).
       YOUTUBE_ENABLED: ${YOUTUBE_ENABLED:-true}
       PREVIEW_SIZE_GB: ${PREVIEW_SIZE_GB:-2}
+      # Warm yt-dlp + JS runtime at boot so the first play isn't slowed by the
+      # one-time challenge-solver setup.
+      YOUTUBE_WARMUP: ${YOUTUBE_WARMUP:-true}
       YTDLP_PATH: ${YTDLP_PATH:-yt-dlp}
       # Extra yt-dlp flags (whitespace-separated), e.g. "--extractor-args
       # youtube:player_client=tv". A JS runtime is auto-selected (image ships

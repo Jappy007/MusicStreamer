@@ -34,6 +34,7 @@ type Config struct {
 	CacheMaxBytes    int64
 	PreviewSizeGB    float64
 	YoutubeEnabled   bool
+	YoutubeWarmup    bool
 	YtDlpBin         string
 	YtDlpCookies     string
 	YtDlpArgs        []string
@@ -77,6 +78,10 @@ func loadConfig() Config {
 	if v := strings.TrimSpace(os.Getenv("YOUTUBE_ENABLED")); v != "" {
 		ytEnabled = !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no"))
 	}
+	ytWarmup := true
+	if v := strings.TrimSpace(os.Getenv("YOUTUBE_WARMUP")); v != "" {
+		ytWarmup = !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no"))
+	}
 	return Config{
 		SubsonicUser:     getenv("SUBSONIC_USER", "admin"),
 		SubsonicPass:     getenv("SUBSONIC_PASS", "admin"),
@@ -84,6 +89,7 @@ func loadConfig() Config {
 		CacheMaxBytes:    int64(cacheGB * 1024 * 1024 * 1024),
 		PreviewSizeGB:    previewGB,
 		YoutubeEnabled:   ytEnabled,
+		YoutubeWarmup:    ytWarmup,
 		YtDlpBin:         getenv("YTDLP_PATH", "yt-dlp"),
 		YtDlpCookies:     strings.TrimSpace(os.Getenv("YTDLP_COOKIES")),
 		YtDlpArgs:        strings.Fields(os.Getenv("YTDLP_ARGS")),
@@ -139,6 +145,18 @@ func main() {
 					cfg.YtDlpBin, ver, cfg.PreviewSizeGB, cfg.YtDlpCookies != "", cfg.YtDlpArgs)
 			}
 			logYoutubeRuntime()
+			if cfg.YoutubeWarmup {
+				go func() {
+					wctx, wcancel := context.WithTimeout(context.Background(), 90*time.Second)
+					defer wcancel()
+					start := time.Now()
+					if err := yt.Warm(wctx); err != nil {
+						log.Printf("youtube: warm-up failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
+						return
+					}
+					log.Printf("youtube: warm-up ok in %s", time.Since(start).Round(time.Millisecond))
+				}()
+			}
 		} else {
 			log.Printf("youtube: %s not found on PATH - instant playback disabled", cfg.YtDlpBin)
 		}

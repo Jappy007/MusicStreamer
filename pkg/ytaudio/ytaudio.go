@@ -99,6 +99,26 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// warmURL is a stable, always-available video used only to pay yt-dlp's
+// one-time cold-start cost (loading the JS runtime and its EJS challenge
+// solver) before a user request needs it.
+const warmURL = "https://www.youtube.com/watch?v=BaW_jenozKc"
+
+// Warm runs one throwaway resolve to populate the runtime/EJS caches so the
+// first real request is fast. Safe to call in the background.
+func (c *Client) Warm(ctx context.Context) error {
+	if !c.Enabled() {
+		return errors.New("ytaudio: disabled")
+	}
+	args := []string{"--no-playlist", "--no-warnings", "--no-progress", "-f", "140/bestaudio/best", "-g"}
+	if c.cookies != "" {
+		args = append(args, "--cookies", c.cookies)
+	}
+	args = append(args, c.extraArgs...)
+	args = append(args, warmURL)
+	return exec.CommandContext(ctx, c.bin, args...).Run()
+}
+
 // Resolve searches YouTube for "artist title" and returns a direct audio URL.
 // best selects the highest-quality audio (the canonical fallback); otherwise a
 // low-bitrate m4a is chosen for fast, instant playback.

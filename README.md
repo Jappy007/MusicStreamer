@@ -43,6 +43,11 @@ Song IDs are reversible `base64url(artist\x1falbum\x1ftitle)` — stateless, no 
 > failures now include yt-dlp's own stderr (missing runtime, bot check, format
 > unavailable). Without a working `yt-dlp`, playback falls back to **blocking
 > Soulseek** (you'll see the file download on slskd before audio starts).
+>
+> The first YouTube lookup after boot pays a one-time cost (loading the JS
+> runtime and challenge solver); a **startup warm-up** (`YOUTUBE_WARMUP`, on by
+> default) hides it. If a client gives up mid-lookup, the resolve keeps going
+> and its preview is downloaded in the background, so the retry is instant.
 
 ## Quickstart
 

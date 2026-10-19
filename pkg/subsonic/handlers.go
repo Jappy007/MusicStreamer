@@ -672,13 +672,21 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 
 	// Tier 3: resolve a fresh YouTube preview and stream it now.
 	if s.yt != nil && s.yt.Enabled() {
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		st, rerr := s.yt.Resolve(ctx, artist, title, false)
-		cancel()
+		// Detached from the client context: a client that gives up early
+		// (common on a cold YouTube lookup) must not abort a resolve that is
+		// nearly done — the result is still cached for its retry.
+		rctx, rcancel := context.WithTimeout(context.Background(), 90*time.Second)
+		st, rerr := s.yt.Resolve(rctx, artist, title, false)
+		rcancel()
 		if rerr == nil {
-			log.Printf("stream: %q - %q: tier=youtube preview", artist, title)
 			s.pin(r.RemoteAddr, id, variantPreview)
-			s.servePreview(w, r, id, st)
+			if r.Context().Err() != nil {
+				log.Printf("stream: %q - %q: client left during resolve; caching preview for the retry", artist, title)
+				go s.cachePreview(id, st)
+			} else {
+				log.Printf("stream: %q - %q: tier=youtube preview", artist, title)
+				s.servePreview(w, r, id, st)
+			}
 			go s.startFullFetch(id, artist, album, title)
 			return
 		}
@@ -766,6 +774,53 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string,
 	}
 	if err := s.preview.CommitTemp(id, tmpPath); err != nil {
 		log.Printf("stream: preview cache store %s: %v", id, err)
+	}
+}
+
+// cachePreview downloads a resolved preview URL in full and commits it to the
+// preview cache. Used when the requesting client disconnects mid-resolve, so
+// its retry (or the next click) starts instantly instead of re-running yt-dlp.
+func (s *Server) cachePreview(id string, st ytaudio.Stream) {
+	if s.preview == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, st.URL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "MusicStreamer/1.0")
+	resp, err := s.proxy.Do(req)
+	if err != nil {
+		log.Printf("stream: preview warm %s: %v", id, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	tmp, err := os.CreateTemp(s.preview.Dir(), id+".*.tmp")
+	if err != nil {
+		return
+	}
+	tmpPath := tmp.Name()
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := s.preview.CommitTemp(id, tmpPath); err != nil {
+		log.Printf("stream: preview warm store %s: %v", id, err)
 	}
 }
 
