@@ -76,6 +76,9 @@ func New(httpClient *http.Client) *Client {
 
 // Search returns up to limit songs for query, trying Deezer first.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]Song, error) {
+	if c == nil {
+		return nil, nil
+	}
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}

@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// Route registers every Subsonic endpoint on mux for both GET and POST,
-// with and without the .view suffix style used by various clients.
-// Only the five required endpoints carry real logic; the rest are compat
-// stubs so Symfonium/Feishin don't hard-fail on library browse.
+// Route registers the Subsonic/OpenSubsonic endpoints on mux for both GET and
+// POST, with and without the .view suffix style used by various clients.
+// Playlists, favourites, ratings and playback state are persisted; features
+// the server has no backing store for (shares, radio, podcasts, chat) return
+// valid empty responses so clients do not fail on them.
 func Route(mux *http.ServeMux, s *Server) {
 	bind := func(pattern string, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, h)         // GET+POST
@@ -23,23 +24,86 @@ func Route(mux *http.ServeMux, s *Server) {
 	bind("/rest/getSong", s.GetSong)
 	bind("/rest/stream", s.Stream)
 
-	// Compat stubs (keep native clients happy).
+	// Browsing.
 	bind("/rest/getMusicFolders", s.MusicFolders)
 	bind("/rest/getUser", s.GetUser)
-	bind("/rest/getIndexes", s.Indexes)
+	bind("/rest/getUsers", s.GetUsers)
+	bind("/rest/getAvatar", s.GetAvatar)
+	bind("/rest/getIndexes", s.GetIndexes)
 	bind("/rest/getArtists", s.Indexes)
 	bind("/rest/getAlbumList", s.AlbumList)
 	bind("/rest/getAlbumList2", s.AlbumList2)
 	bind("/rest/getRandomSongs", s.RandomSongs)
 	bind("/rest/getAlbum", s.GetAlbum)
 	bind("/rest/getArtist", s.GetArtist)
+	bind("/rest/getMusicDirectory", s.GetMusicDirectory)
 	bind("/rest/getCoverArt", s.CoverArt)
-	bind("/rest/jukeboxControl", s.Jukebox)
+	bind("/rest/download", s.Download)
+	bind("/rest/search2", s.Search2)
+
+	// Artist / album info + lyrics.
+	bind("/rest/getArtistInfo", s.GetArtistInfo)
+	bind("/rest/getArtistInfo2", s.GetArtistInfo2)
+	bind("/rest/getAlbumInfo", s.GetAlbumInfo)
+	bind("/rest/getAlbumInfo2", s.GetAlbumInfo2)
+	bind("/rest/getLyrics", s.GetLyrics)
+	bind("/rest/getLyricsBySongId", s.GetLyricsBySongId)
+
+	// Playlists.
+	bind("/rest/getPlaylists", s.GetPlaylists)
+	bind("/rest/getPlaylist", s.GetPlaylist)
+	bind("/rest/createPlaylist", s.CreatePlaylist)
+	bind("/rest/updatePlaylist", s.UpdatePlaylist)
+	bind("/rest/deletePlaylist", s.DeletePlaylist)
+
+	// Media annotation / playback state.
+	bind("/rest/star", s.Star)
+	bind("/rest/unstar", s.Unstar)
+	bind("/rest/setRating", s.SetRating)
+	bind("/rest/getStarred", s.GetStarred)
+	bind("/rest/getStarred2", s.GetStarred2)
 	bind("/rest/scrobble", s.Scrobble)
-	bind("/rest/getPlaylists", s.Playlists)
+	bind("/rest/getNowPlaying", s.GetNowPlaying)
+	bind("/rest/getPlayQueue", s.GetPlayQueue)
+	bind("/rest/savePlayQueue", s.SavePlayQueue)
+
+	// Scanner + genres.
+	bind("/rest/getScanStatus", s.GetScanStatus)
+	bind("/rest/getScanStatus2", s.GetScanStatus)
+	bind("/rest/startScan", s.StartScan)
 	bind("/rest/getGenres", s.Genres)
-	bind("/rest/getStarred", s.Starred)
-	bind("/rest/getStarred2", s.Starred2)
+	bind("/rest/getSongsByGenre", s.SongsByGenre)
+	bind("/rest/getTopSongs", s.TopSongs)
+	bind("/rest/getSimilarSongs", s.SimilarSongs)
+	bind("/rest/getSimilarSongs2", s.SimilarSongs2)
+
+	// Empty-but-valid reads for stores this server does not implement.
+	bind("/rest/getShares", s.EmptyShares)
+	bind("/rest/refreshShares", s.EmptyShares)
+	bind("/rest/getBookmarks", s.EmptyBookmarks)
+	bind("/rest/getInternetRadioStations", s.EmptyRadioStations)
+	bind("/rest/getVideos", s.EmptyVideos)
+	bind("/rest/getPodcasts", s.EmptyPodcasts)
+	bind("/rest/getNewestPodcasts", s.EmptyPodcasts)
+	bind("/rest/getChatMessages", s.EmptyChat)
+	bind("/rest/getCaptions", s.NotImplemented)
+
+	// Mutating endpoints for those stores: answer with a Subsonic error
+	// rather than 404 so clients report "not supported", not "server down".
+	for _, path := range []string{
+		"/rest/createShare", "/rest/updateShare", "/rest/deleteShare",
+		"/rest/createBookmark", "/rest/deleteBookmark",
+		"/rest/createInternetRadioStation", "/rest/updateInternetRadioStation",
+		"/rest/deleteInternetRadioStation",
+		"/rest/addChatMessage",
+		"/rest/refreshPodcasts", "/rest/createPodcastChannel",
+		"/rest/deletePodcastChannel", "/rest/deletePodcastEpisode",
+		"/rest/downloadPodcastEpisode",
+	} {
+		bind(path, s.NotImplemented)
+	}
+
+	bind("/rest/jukeboxControl", s.Jukebox)
 	bind("/rest/getOpenSubsonicExtensions", s.OpenExtensions)
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

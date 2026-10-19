@@ -119,7 +119,75 @@ func (s *Server) cachedEntry(cs cachedSong) SongEntry {
 			e.BitRate = info.BitRate
 		}
 	}
+	if s.lib != nil {
+		e.PlayCount = s.lib.PlayCount(cs.id)
+		e.UserRating = s.lib.Rating(cs.id)
+	}
 	return e
+}
+
+// entryForID renders any song ID: the cached entry when present, otherwise a
+// metadata-only entry. Playlists and starred lists therefore keep working for
+// tracks that the LRU has evicted (they resolve again on demand at play time).
+func (s *Server) entryForID(id string) (SongEntry, bool) {
+	if e, ok := s.catalog().songForID(id); ok {
+		return e, true
+	}
+	artist, album, title, err := metadata.SplitID(id)
+	if err != nil || strings.TrimSpace(title) == "" {
+		return SongEntry{}, false
+	}
+	m := metadata.Song{
+		ID: id, Artist: artist, Album: album, Title: title,
+		AlbumID:  metadata.EncodeID(artist, album, ""),
+		ArtistID: metadata.EncodeID(artist, "", ""),
+	}
+	e := songToEntry(m)
+	if s.lib != nil {
+		e.PlayCount = s.lib.PlayCount(id)
+		e.UserRating = s.lib.Rating(id)
+	}
+	return e, true
+}
+
+// albumEntryForID renders an album ID, preferring the cached grouping.
+func (s *Server) albumEntryForID(id string) (AlbumEntry, bool) {
+	artist, album, _, err := metadata.SplitID(id)
+	if err != nil || strings.TrimSpace(album) == "" {
+		return AlbumEntry{}, false
+	}
+	cat := s.catalog()
+	if songs := cat.byArtist[artist][album]; len(songs) > 0 {
+		return cat.albumEntry(artist, album), true
+	}
+	return AlbumEntry{
+		ID: id, Name: displayAlbum(album), Artist: artist,
+		ArtistID: metadata.EncodeID(artist, "", ""), CoverArt: id,
+	}, true
+}
+
+// artistEntryForID renders an artist ID, preferring the cached grouping.
+func (s *Server) artistEntryForID(id string) (ArtistEntry, bool) {
+	artist, album, title, err := metadata.SplitID(id)
+	if err != nil {
+		return ArtistEntry{}, false
+	}
+	if artist == "" {
+		artist = album
+	}
+	if artist == "" {
+		artist = title
+	}
+	if strings.TrimSpace(artist) == "" {
+		return ArtistEntry{}, false
+	}
+	cat := s.catalog()
+	return ArtistEntry{
+		ID:         metadata.EncodeID(artist, "", ""),
+		Name:       artist,
+		CoverArt:   metadata.EncodeID(artist, "", ""),
+		AlbumCount: len(cat.byArtist[artist]),
+	}, true
 }
 
 // artistEntries lists artists (with album counts) for getArtists/getIndexes.
@@ -149,12 +217,16 @@ func (c *catalog) albumEntries() []AlbumEntry {
 
 func (c *catalog) albumEntry(artist, album string) AlbumEntry {
 	aid := metadata.EncodeID(artist, album, "")
-	return AlbumEntry{
+	e := AlbumEntry{
 		ID: aid, Name: displayAlbum(album), Artist: artist,
 		ArtistID:  metadata.EncodeID(artist, "", ""),
 		CoverArt:  aid,
 		SongCount: len(c.byArtist[artist][album]),
 	}
+	if c.s != nil && c.s.lib != nil {
+		e.UserRating = c.s.lib.Rating(aid)
+	}
+	return e
 }
 
 // sortedAlbums returns an artist's albums in case-insensitive name order.

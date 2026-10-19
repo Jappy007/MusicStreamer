@@ -1,9 +1,11 @@
-// Command MusicStreamer is an ultra-lightweight Subsonic-compatible music
+// Command MusicStreamer is an ultra-lightweight Subsonic/OpenSubsonic music
 // server that resolves tracks through the local LRU disk cache and Soulseek
-// (slskd) only — no external indexers, no persistent database.
+// (slskd) on demand. It presents itself as Navidrome and implements the
+// client-facing API surface (playlists, favourites, ratings, scrobbling,
+// play-queue sync, browsing/search) with a small JSON state file.
 //
 // Tiny static binary, <30 MB RAM: stdlib-only, streaming I/O throughout,
-// O(files) cache index, no DB, no in-memory audio buffering.
+// O(files) cache index, no catalog database, no in-memory audio buffering.
 package main
 
 import (
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/musicstreamer/musicstreamer/pkg/cache"
+	"github.com/musicstreamer/musicstreamer/pkg/library"
 	"github.com/musicstreamer/musicstreamer/pkg/metadata"
 	"github.com/musicstreamer/musicstreamer/pkg/soulseek"
 	"github.com/musicstreamer/musicstreamer/pkg/subsonic"
@@ -30,6 +33,9 @@ type Config struct {
 	SubsonicUser     string
 	SubsonicPass     string
 	CacheDir         string
+	StateDir         string
+	ServerType       string
+	ServerVersion    string
 	CacheMaxBytes    int64
 	PreviewSizeGB    float64
 	YoutubeEnabled   bool
@@ -67,10 +73,16 @@ func loadConfig() Config {
 	if v := strings.TrimSpace(os.Getenv("YOUTUBE_WARMUP")); v != "" {
 		ytWarmup = !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "no"))
 	}
+	cacheDir := getenv("CACHE_DIR", "/data/cache")
 	return Config{
-		SubsonicUser:     getenv("SUBSONIC_USER", "admin"),
-		SubsonicPass:     getenv("SUBSONIC_PASS", "admin"),
-		CacheDir:         getenv("CACHE_DIR", "/data/cache"),
+		SubsonicUser: getenv("SUBSONIC_USER", "admin"),
+		SubsonicPass: getenv("SUBSONIC_PASS", "admin"),
+		CacheDir:     cacheDir,
+		StateDir:     getenv("STATE_DIR", filepath.Join(cacheDir, "state")),
+		// Present as Navidrome so clients built for it enable their full
+		// feature set (playlists, favourites, ratings, now-playing).
+		ServerType:       getenv("SERVER_TYPE", "navidrome"),
+		ServerVersion:    getenv("SERVER_VERSION", "0.55.0"),
 		CacheMaxBytes:    int64(cacheGB * 1024 * 1024 * 1024),
 		PreviewSizeGB:    previewGB,
 		YoutubeEnabled:   ytEnabled,
@@ -111,6 +123,13 @@ func main() {
 		log.Fatalf("preview cache init: %v", err)
 	}
 	go cache.StartCleaner(preview, time.Minute, stopCleaner)
+
+	// Persistent user state (playlists, stars, ratings, play counts, queue).
+	// The JSON file lives beside the cache so no extra volume is required.
+	lib, err := library.New(cfg.StateDir)
+	if err != nil {
+		log.Fatalf("library state init: %v", err)
+	}
 
 	// Metadata is used only for library browsing/search (Deezer/MusicBrainz).
 	meta := metadata.New(nil)
@@ -162,7 +181,8 @@ func main() {
 		log.Println("soulseek: disabled; set SLSKD_URL to enable")
 	}
 
-	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, yt, store, preview, nil)
+	subsonic.ConfigureIdentity(cfg.ServerType, cfg.ServerVersion)
+	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, yt, store, preview, lib, nil)
 
 	mux := http.NewServeMux()
 	subsonic.Route(mux, srv)
@@ -188,7 +208,8 @@ func main() {
 		_ = httpSrv.Shutdown(ctx)
 	}()
 
-	log.Printf("MusicStreamer listening on :%s (user=%s)", cfg.Port, cfg.SubsonicUser)
+	log.Printf("MusicStreamer listening on :%s (user=%s, presenting as %s %s, state=%s)",
+		cfg.Port, cfg.SubsonicUser, cfg.ServerType, cfg.ServerVersion, cfg.StateDir)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
 	}

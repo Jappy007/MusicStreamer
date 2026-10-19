@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/musicstreamer/musicstreamer/pkg/audioinfo"
 	"github.com/musicstreamer/musicstreamer/pkg/cache"
+	"github.com/musicstreamer/musicstreamer/pkg/library"
 	"github.com/musicstreamer/musicstreamer/pkg/metadata"
 	"github.com/musicstreamer/musicstreamer/pkg/soulseek"
 	"github.com/musicstreamer/musicstreamer/pkg/ytaudio"
@@ -28,6 +31,7 @@ type Server struct {
 	yt       *ytaudio.Client
 	storage  *cache.Manager
 	preview  *cache.Manager
+	lib      *library.Store
 
 	// proxy performs upstream GETs (cover art, YouTube audio previews). No
 	// client-level Timeout: the request context governs each fetch.
@@ -69,7 +73,7 @@ type infoCache struct {
 // NewServer builds a handler set. proxy may be nil (a default is used).
 // sk and yt may be nil (disables the Soulseek and YouTube preview sources).
 // preview may be nil (disables lossy instant-playback caching).
-func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *ytaudio.Client, s *cache.Manager, preview *cache.Manager, proxy *http.Client) *Server {
+func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *ytaudio.Client, s *cache.Manager, preview *cache.Manager, lib *library.Store, proxy *http.Client) *Server {
 	if proxy == nil {
 		proxy = &http.Client{
 			Transport: &http.Transport{
@@ -81,7 +85,7 @@ func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *y
 	}
 	return &Server{
 		user: user, pass: pass,
-		meta: m, soulseek: sk, yt: yt, storage: s, preview: preview,
+		meta: m, soulseek: sk, yt: yt, storage: s, preview: preview, lib: lib,
 		proxy:   proxy,
 		warmSem: make(chan struct{}, 2),
 	}
@@ -120,7 +124,7 @@ func (s *Server) MusicFolders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.MusicFolders = &MusicFolders{Folders: []Folder{{ID: 0, Name: "Debrid"}}}
+	resp.MusicFolders = &MusicFolders{Folders: []Folder{{ID: 0, Name: "Music"}}}
 	write(w, r, resp)
 }
 
@@ -131,70 +135,73 @@ func (s *Server) GetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.User = &User{
-		Username:          s.user,
-		ScrobblingEnabled: false,
-		AdminRole:         true,
-		SettingsRole:      true,
-		DownloadRole:      true,
-		UploadRole:        false,
-		PlaylistRole:      true,
-		CoverArtRole:      true,
-		CommentRole:       false,
-		PodcastRole:       false,
-		StreamRole:        true,
-		JukeboxRole:       false,
-		ShareRole:         false,
-		Folders:           []int{0},
-	}
+	user := s.userEntry()
+	resp.User = &user
 	write(w, r, resp)
 }
 
-// Empty-library stubs: playlists/genres/starred have no persistent store on
-// this server (tracks resolve via metadata search + debrid). Album/artist
-// browse is cache-backed; see catalog.go.
-func (s *Server) Playlists(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(w, r) {
-		return
+// albumList returns cached albums ordered per the Subsonic `type` parameter.
+// Only the cache is browsable; ordering that needs play history (newest,
+// recent, frequent) falls back to case-insensitive album name.
+func (s *Server) albumList(r *http.Request) []AlbumEntry {
+	_ = r.ParseForm()
+	typ := strings.ToLower(firstOf(r.Form, "type"))
+	size := atoiWithDefault(firstOf(r.Form, "size"), 500)
+	if size > 500 {
+		size = 500
 	}
-	resp := okResponse()
-	resp.Playlists = &Playlists{}
-	write(w, r, resp)
+	offset := atoiWithDefault(firstOf(r.Form, "offset"), 0)
+	if offset < 0 {
+		offset = 0
+	}
+	cat := s.catalog()
+	var albums []AlbumEntry
+	switch typ {
+	case "starred":
+		if s.lib != nil {
+			for _, id := range s.lib.StarredAlbums() {
+				if e, ok := s.albumEntryForID(id); ok {
+					albums = append(albums, e)
+				}
+			}
+		}
+		return pageAlbums(albums, offset, size)
+	case "random":
+		albums = cat.albumEntries()
+		rand.Shuffle(len(albums), func(i, j int) {
+			albums[i], albums[j] = albums[j], albums[i]
+		})
+		return pageAlbums(albums, offset, size)
+	default:
+		albums = cat.albumEntries()
+	}
+	sort.Slice(albums, func(i, j int) bool {
+		if typ == "alphabeticalbyartist" && !strings.EqualFold(albums[i].Artist, albums[j].Artist) {
+			return strings.ToLower(albums[i].Artist) < strings.ToLower(albums[j].Artist)
+		}
+		return strings.ToLower(albums[i].Name) < strings.ToLower(albums[j].Name)
+	})
+	return pageAlbums(albums, offset, size)
 }
 
-func (s *Server) Genres(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(w, r) {
-		return
+func pageAlbums(albums []AlbumEntry, offset, size int) []AlbumEntry {
+	if offset > len(albums) {
+		offset = len(albums)
 	}
-	resp := okResponse()
-	resp.Genres = &Genres{}
-	write(w, r, resp)
+	end := offset + size
+	if end > len(albums) {
+		end = len(albums)
+	}
+	return albums[offset:end]
 }
 
+// AlbumList serves the pre-ID3 album list (cache-backed; see catalog.go).
 func (s *Server) AlbumList(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(w, r) {
 		return
 	}
 	resp := okResponse()
-	resp.AlbumList = &AlbumList{Albums: s.catalog().albumEntries()}
-	write(w, r, resp)
-}
-
-func (s *Server) Starred(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(w, r) {
-		return
-	}
-	resp := okResponse()
-	resp.Starred = &Starred{}
-	write(w, r, resp)
-}
-
-func (s *Server) Starred2(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(w, r) {
-		return
-	}
-	resp := okResponse()
-	resp.Starred2 = &Starred2{}
+	resp.AlbumList = &AlbumList{Albums: s.albumList(r)}
 	write(w, r, resp)
 }
 
@@ -203,7 +210,7 @@ func (s *Server) AlbumList2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.AlbumList2 = &AlbumList2{Albums: s.catalog().albumEntries()}
+	resp.AlbumList2 = &AlbumList2{Albums: s.albumList(r)}
 	write(w, r, resp)
 }
 
@@ -419,21 +426,15 @@ func (s *Server) GetArtist(w http.ResponseWriter, r *http.Request) {
 	write(w, r, resp)
 }
 
-// Scrobble accepts play-event reports and discards them (no listening
-// history is stored). Always ok so clients don't retry.
-func (s *Server) Scrobble(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(w, r) {
-		return
-	}
-	write(w, r, okResponse())
-}
-
 func (s *Server) Indexes(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(w, r) {
 		return
 	}
 	resp := okResponse()
-	resp.Artists = &Artists{Ignored: "The An A", List: s.catalog().artistEntries()}
+	resp.Artists = &Artists{
+		Ignored: "The El La Los Las Le Les",
+		Index:   indexGroups(s.catalog().artistEntries()),
+	}
 	write(w, r, resp)
 }
 
@@ -442,7 +443,11 @@ func (s *Server) OpenExtensions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := okResponse()
-	resp.Extensions = &Extensions{List: []Extension{{Name: "search3", Versions: []int{1}}}}
+	resp.Extensions = &Extensions{List: []Extension{
+		{Name: "search3", Versions: []int{1}},
+		{Name: "formPost", Versions: []int{1}},
+		{Name: "songLyrics", Versions: []int{1}},
+	}}
 	resp.ServerInfo = &ServerInfo{Version: serverVersion}
 	write(w, r, resp)
 }
@@ -466,10 +471,11 @@ func songToEntry(m metadata.Song) SongEntry {
 	}
 }
 
-func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(w, r) {
-		return
-	}
+// searchAll resolves the requested page of search results plus the distinct
+// albums/artists those songs belong to. An empty query means "the whole cached
+// library" (clients page it via songOffset/songCount); a non-empty query
+// returns cached matches first, then metadata-search results.
+func (s *Server) searchAll(r *http.Request) (*SearchResult, error) {
 	_ = r.ParseForm()
 	query := strings.TrimSpace(firstOf(r.Form, "query", "q"))
 	songCount := atoiWithDefault(firstOf(r.Form, "songCount", "count"), 20)
@@ -484,11 +490,6 @@ func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
 		offset = 0
 	}
 
-	// A flat list of every cached track. This is what clients (Feishin's
-	// Songs view, and anything else that paginates the whole library) hit:
-	// they call search3 with a query of "" and page via songOffset/songCount.
-	// Each entry is one cached file — a track, exposed on a track-by-track
-	// basis, not rolled up into albums or artists.
 	cat := s.catalog()
 	var entries []SongEntry
 	if query == "" {
@@ -508,8 +509,7 @@ func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		songs, err := s.meta.Search(ctx, query, songCount)
 		if err != nil && len(entries) == 0 {
-			writeFail(w, r, 0, "search failed: "+err.Error())
-			return
+			return nil, err
 		}
 		for _, m := range songs {
 			e := songToEntry(m)
@@ -528,10 +528,40 @@ func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
 	if end > len(entries) {
 		end = len(entries)
 	}
-	resp := okResponse()
 	page := entries[offset:end]
-	resp.SearchResult3 = &SearchResult{Songs: page}
-	s.prewarmPage(page)
+
+	res := &SearchResult{Songs: page}
+	seenAlbums := make(map[string]bool)
+	seenArtists := make(map[string]bool)
+	for _, e := range page {
+		if e.AlbumID != "" && !seenAlbums[e.AlbumID] {
+			seenAlbums[e.AlbumID] = true
+			if ae, ok := s.albumEntryForID(e.AlbumID); ok {
+				res.Albums = append(res.Albums, ae)
+			}
+		}
+		if e.ArtistID != "" && !seenArtists[e.ArtistID] {
+			seenArtists[e.ArtistID] = true
+			if ae, ok := s.artistEntryForID(e.ArtistID); ok {
+				res.Artists = append(res.Artists, ae)
+			}
+		}
+	}
+	return res, nil
+}
+
+func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(w, r) {
+		return
+	}
+	res, err := s.searchAll(r)
+	if err != nil {
+		writeFail(w, r, 0, "search failed: "+err.Error())
+		return
+	}
+	resp := okResponse()
+	resp.SearchResult3 = res
+	s.prewarmPage(res.Songs)
 	write(w, r, resp)
 }
 
@@ -604,6 +634,10 @@ func (s *Server) GetSong(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := okResponse()
 	e := songToEntry(m)
+	if s.lib != nil {
+		e.PlayCount = s.lib.PlayCount(id)
+		e.UserRating = s.lib.Rating(id)
+	}
 	resp.Song = &e
 	s.prewarmPage([]SongEntry{e})
 	write(w, r, resp)

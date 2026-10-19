@@ -24,6 +24,12 @@ services:
     environment:
       SUBSONIC_USER: ${SUBSONIC_USER:-admin}
       SUBSONIC_PASS: ${SUBSONIC_PASS:-admin}
+      # Present as Navidrome so clients built for it enable their full
+      # feature set (persistent playlists, favourites, ratings, now-playing).
+      SERVER_TYPE: ${SERVER_TYPE:-navidrome}
+      SERVER_VERSION: ${SERVER_VERSION:-0.55.0}
+      # User-state JSON lives inside the cache volume (no extra volume needed).
+      STATE_DIR: ${STATE_DIR:-/data/cache/state}
       CACHE_SIZE_GB: ${CACHE_SIZE_GB:-10}
       CACHE_DIR: /data/cache
       # Instant playback: a low-bitrate YouTube preview streams immediately
