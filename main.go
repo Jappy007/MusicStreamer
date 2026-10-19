@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,7 @@ type Config struct {
 	YoutubeEnabled   bool
 	YtDlpBin         string
 	YtDlpCookies     string
+	YtDlpArgs        []string
 	SlskdURL         string
 	SlskdAPIKey      string
 	SlskdDownloadDir string
@@ -46,6 +48,20 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// logYoutubeRuntime reports which JS runtime yt-dlp will use. YouTube
+// extraction needs one (deno is enabled by default; node must be selected via
+// YTDLP_ARGS="--js-runtimes node"). A missing runtime is the most common cause
+// of silent extraction failures.
+func logYoutubeRuntime() {
+	for _, rt := range []string{"deno", "node", "bun", "quickjs"} {
+		if p, err := exec.LookPath(rt); err == nil {
+			log.Printf("youtube: JS runtime %q found at %s", rt, p)
+			return
+		}
+	}
+	log.Printf("youtube: WARNING no JS runtime (deno/node/bun/quickjs) on PATH - YouTube extraction will likely fail; install deno in the image or set YTDLP_ARGS")
 }
 
 func loadConfig() Config {
@@ -70,6 +86,7 @@ func loadConfig() Config {
 		YoutubeEnabled:   ytEnabled,
 		YtDlpBin:         getenv("YTDLP_PATH", "yt-dlp"),
 		YtDlpCookies:     strings.TrimSpace(os.Getenv("YTDLP_COOKIES")),
+		YtDlpArgs:        strings.Fields(os.Getenv("YTDLP_ARGS")),
 		SlskdURL:         strings.TrimSpace(os.Getenv("SLSKD_URL")),
 		SlskdAPIKey:      strings.TrimSpace(os.Getenv("SLSKD_API_KEY")),
 		SlskdDownloadDir: strings.TrimSpace(os.Getenv("SLSKD_DOWNLOAD_DIR")),
@@ -110,9 +127,18 @@ func main() {
 	// Instant-playback previews via yt-dlp (on by default; needs yt-dlp on PATH).
 	var yt *ytaudio.Client
 	if cfg.YoutubeEnabled {
-		yt = ytaudio.New(cfg.YtDlpBin, cfg.YtDlpCookies)
+		yt = ytaudio.New(cfg.YtDlpBin, cfg.YtDlpCookies, cfg.YtDlpArgs)
 		if yt.Enabled() {
-			log.Printf("youtube: enabled via %s (preview budget %.1fGiB, cookies=%v)", cfg.YtDlpBin, cfg.PreviewSizeGB, cfg.YtDlpCookies != "")
+			vctx, vcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ver, verr := yt.Version(vctx)
+			vcancel()
+			if verr != nil {
+				log.Printf("youtube: enabled via %s but version check failed: %v", cfg.YtDlpBin, verr)
+			} else {
+				log.Printf("youtube: enabled via %s (version %s, preview budget %.1fGiB, cookies=%v, extra args=%v)",
+					cfg.YtDlpBin, ver, cfg.PreviewSizeGB, cfg.YtDlpCookies != "", cfg.YtDlpArgs)
+			}
+			logYoutubeRuntime()
 		} else {
 			log.Printf("youtube: %s not found on PATH - instant playback disabled", cfg.YtDlpBin)
 		}

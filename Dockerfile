@@ -21,7 +21,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     -o /out/musicstreamer .
 
 FROM alpine:latest
-RUN apk add --no-cache ca-certificates tzdata yt-dlp \
+# yt-dlp resolves YouTube audio; nodejs is its JS runtime for YouTube's
+# challenges (Alpine's node is >=22, injected as --js-runtimes node at runtime).
+RUN apk add --no-cache ca-certificates tzdata yt-dlp nodejs \
     && addgroup -S app && adduser -S app -G app \
     && mkdir -p /data/cache && chown -R app:app /data
 COPY --from=builder /out/musicstreamer /usr/local/bin/musicstreamer

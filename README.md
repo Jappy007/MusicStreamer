@@ -33,10 +33,16 @@ server, so it keeps the preview until the track is re-opened.
 
 Song IDs are reversible `base64url(artist\x1falbum\x1ftitle)` — stateless, no DB.
 
-> **yt-dlp freshness:** YouTube changes often, so the bundled `yt-dlp` can go
-> stale. Point `YTDLP_PATH` at a newer binary, `pip install -U yt-dlp` in the
-> image, or mount cookies via `YTDLP_COOKIES` if YouTube starts challenging the
-> server. Without a working `yt-dlp`, playback falls back to blocking Soulseek.
+> **yt-dlp, JS runtimes, and freshness:** since late 2025 YouTube's player
+> needs an external **JS runtime** for yt-dlp to solve its challenges. The
+> image ships `nodejs` and the server auto-adds `--js-runtimes node` (or uses
+> `deno` if present), so this works out of the box. YouTube also changes often
+> and may still challenge the server's IP: pass extra flags with `YTDLP_ARGS`,
+> mount cookies via `YTDLP_COOKIES`, or point `YTDLP_PATH` at a newer binary.
+> Diagnosis: `docker compose logs musicstreamer | grep youtube` — resolve
+> failures now include yt-dlp's own stderr (missing runtime, bot check, format
+> unavailable). Without a working `yt-dlp`, playback falls back to **blocking
+> Soulseek** (you'll see the file download on slskd before audio starts).
 
 ## Quickstart
 

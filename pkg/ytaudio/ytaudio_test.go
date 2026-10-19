@@ -7,7 +7,7 @@ import (
 )
 
 func TestResolveArgsPreview(t *testing.T) {
-	args := resolveArgs("Boards of Canada Roygbiv", false, "")
+	args := resolveArgs("Boards of Canada Roygbiv", false, "", nil)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "ytsearch1:Boards of Canada Roygbiv") {
 		t.Fatalf("missing search term: %v", args)
@@ -24,7 +24,7 @@ func TestResolveArgsPreview(t *testing.T) {
 }
 
 func TestResolveArgsBest(t *testing.T) {
-	args := resolveArgs("x y", true, "/data/cookies.txt")
+	args := resolveArgs("x y", true, "/data/cookies.txt", []string{"--js-runtimes", "node"})
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "bestaudio[ext=m4a]/bestaudio/best") {
 		t.Fatalf("best format not selected: %v", args)
@@ -32,8 +32,11 @@ func TestResolveArgsBest(t *testing.T) {
 	if !strings.Contains(joined, "--cookies /data/cookies.txt") {
 		t.Fatalf("cookies not passed: %v", args)
 	}
-	if args[0] != "--cookies" {
-		t.Fatalf("cookies flags should lead: %v", args)
+	if !strings.Contains(joined, "--js-runtimes node") {
+		t.Fatalf("extra args not passed: %v", args)
+	}
+	if args[len(args)-1] != "ytsearch1:x y" {
+		t.Fatalf("query must be last: %v", args)
 	}
 }
 
@@ -57,7 +60,7 @@ func TestContentTypeForURL(t *testing.T) {
 }
 
 func TestNewDisabledWhenMissing(t *testing.T) {
-	c := New("definitely-not-a-real-binary-xyz", "")
+	c := New("definitely-not-a-real-binary-xyz", "", nil)
 	if c.Enabled() {
 		t.Fatal("expected disabled for missing binary")
 	}
