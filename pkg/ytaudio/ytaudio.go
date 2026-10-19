@@ -113,7 +113,7 @@ func (c *Client) Resolve(ctx context.Context, artist, title string, best bool) (
 	cmd := exec.CommandContext(ctx, c.bin, resolveArgs(query, best, c.cookies, c.extraArgs)...)
 	out, err := cmd.Output()
 	if err != nil {
-		return Stream{}, fmt.Errorf("ytaudio: %w%s", err, stderrSuffix(err))
+		return Stream{}, fmt.Errorf("ytaudio: %w%s", err, failureDetail(ctx, err))
 	}
 	raw := firstURL(string(out))
 	if raw == "" {
@@ -122,23 +122,34 @@ func (c *Client) Resolve(ctx context.Context, artist, title string, best bool) (
 	return Stream{URL: raw, ContentType: contentTypeForURL(raw)}, nil
 }
 
-// stderrSuffix returns yt-dlp's stderr (captured by Cmd.Output into the
-// ExitError) so the real reason — bot check, missing JS runtime, format
-// unavailable — is visible in our logs instead of a bare "exit status 1".
-func stderrSuffix(err error) string {
+// failureDetail explains a yt-dlp failure. It prefers yt-dlp's own stderr
+// (bot check, missing JS runtime, format unavailable) but, when stderr is
+// empty, distinguishes the three silent-kill causes: our context deadline, a
+// client-cancelled request, or an external SIGKILL (usually the OOM killer).
+func failureDetail(ctx context.Context, err error) string {
 	var ee *exec.ExitError
-	if !errors.As(err, &ee) {
-		return ""
+	if errors.As(err, &ee) {
+		if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
+			return ": " + truncate(strings.Join(strings.Fields(msg), " "), 600)
+		}
 	}
-	msg := strings.TrimSpace(string(ee.Stderr))
-	if msg == "" {
-		return ""
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return " (timed out - YouTube extraction too slow)"
+	case errors.Is(ctx.Err(), context.Canceled):
+		return " (cancelled by client)"
 	}
-	msg = strings.Join(strings.Fields(msg), " ")
-	if len(msg) > 600 {
-		msg = msg[:600] + "…"
+	if errors.As(err, &ee) && ee.ProcessState != nil {
+		return " (killed externally: " + ee.ProcessState.String() + "; likely OOM - raise the container memory limit)"
 	}
-	return ": " + msg
+	return ""
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // resolveArgs builds the yt-dlp argument list. Kept separate so it can be

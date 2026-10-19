@@ -672,7 +672,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 
 	// Tier 3: resolve a fresh YouTube preview and stream it now.
 	if s.yt != nil && s.yt.Enabled() {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		st, rerr := s.yt.Resolve(ctx, artist, title, false)
 		cancel()
 		if rerr == nil {
