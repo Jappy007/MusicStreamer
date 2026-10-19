@@ -14,16 +14,16 @@ import (
 	"fmt"
 	"net/url"
 	"os/exec"
-	"strconv"
 	"strings"
 )
 
 // Client is a yt-dlp-backed resolver. The zero value is not usable; use New.
 type Client struct {
-	bin       string
-	cookies   string
-	extraArgs []string
-	enabled   bool
+	bin          string
+	cookies      string
+	extraArgs    []string
+	fallbackArgs []string
+	enabled      bool
 }
 
 // Stream is a resolved audio source.
@@ -37,24 +37,23 @@ type Stream struct {
 // --cookies (the escape hatch for YouTube bot checks). extraArgs are inserted
 // before the search query (e.g. --extractor-args).
 //
-// Recent yt-dlp needs a JS runtime for YouTube's JS challenges. Deno is
-// enabled by default, so nothing is added when it is present; otherwise, if
-// Node.js (>= 22) is on PATH, --js-runtimes node is injected automatically.
-// A caller-supplied --js-runtimes always wins.
+// By default it selects YouTube's "android_sdkless" player client, which needs
+// no JavaScript runtime and resolves roughly twice as fast as the web client's
+// JS-challenge path. If that client ever fails (e.g. a video it can't access),
+// Resolve retries once with the JS-capable defaults. A caller-supplied
+// --extractor-args or --no-js-runtimes disables both the default and fallback.
 func New(bin, cookiesFile string, extraArgs []string) *Client {
 	bin = strings.TrimSpace(bin)
 	if bin == "" {
 		bin = "yt-dlp"
 	}
 	args := append([]string(nil), extraArgs...)
-	if !hasFlag(args, "--js-runtimes") {
-		if _, err := exec.LookPath("deno"); err != nil {
-			if nodeUsable() {
-				args = append(args, "--js-runtimes", "node")
-			}
-		}
+	var fallback []string
+	if !hasFlag(args, "--extractor-args") && !hasFlag(args, "--no-js-runtimes") {
+		fallback = append([]string{}, args...)
+		args = append(args, "--extractor-args", "youtube:player_client=android_sdkless")
 	}
-	c := &Client{bin: bin, cookies: strings.TrimSpace(cookiesFile), extraArgs: args}
+	c := &Client{bin: bin, cookies: strings.TrimSpace(cookiesFile), extraArgs: args, fallbackArgs: fallback}
 	if _, err := exec.LookPath(bin); err == nil {
 		c.enabled = true
 	}
@@ -69,18 +68,6 @@ func hasFlag(args []string, name string) bool {
 		}
 	}
 	return false
-}
-
-// nodeUsable reports whether a Node.js new enough for yt-dlp's JS challenge
-// solver (>= 22) is on PATH.
-func nodeUsable() bool {
-	out, err := exec.Command("node", "--version").Output()
-	if err != nil {
-		return false
-	}
-	v := strings.TrimPrefix(strings.TrimSpace(string(out)), "v")
-	major, err := strconv.Atoi(strings.SplitN(v, ".", 2)[0])
-	return err == nil && major >= 22
 }
 
 // Enabled reports whether the resolver can run (yt-dlp present, not disabled).
@@ -133,7 +120,21 @@ func (c *Client) Resolve(ctx context.Context, artist, title string, best bool) (
 	if query == "" {
 		return Stream{}, errors.New("ytaudio: empty query")
 	}
-	cmd := exec.CommandContext(ctx, c.bin, resolveArgs(query, best, c.cookies, c.extraArgs)...)
+	st, err := c.try(ctx, query, best, c.extraArgs)
+	if err == nil || c.fallbackArgs == nil {
+		return st, err
+	}
+	// The fast JS-less client failed; retry once with the JS-capable default
+	// (the JS runtime, if installed, handles YouTube's challenge).
+	if st2, err2 := c.try(ctx, query, best, c.fallbackArgs); err2 == nil {
+		return st2, nil
+	}
+	return Stream{}, err
+}
+
+// try runs one resolve with the given extra arguments.
+func (c *Client) try(ctx context.Context, query string, best bool, extra []string) (Stream, error) {
+	cmd := exec.CommandContext(ctx, c.bin, resolveArgs(query, best, c.cookies, extra)...)
 	out, err := cmd.Output()
 	if err != nil {
 		return Stream{}, fmt.Errorf("ytaudio: %w%s", err, failureDetail(ctx, err))

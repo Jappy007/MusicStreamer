@@ -77,3 +77,26 @@ func TestNewDisabledWhenMissing(t *testing.T) {
 		t.Fatal("expected error when disabled")
 	}
 }
+
+func TestNewFastClientDefault(t *testing.T) {
+	c := New("definitely-not-a-real-binary-xyz", "", nil)
+	joined := strings.Join(c.extraArgs, " ")
+	if !strings.Contains(joined, "player_client=android_sdkless") {
+		t.Fatalf("fast client not selected by default: %v", c.extraArgs)
+	}
+	if c.fallbackArgs == nil {
+		t.Fatal("expected a JS-capable fallback")
+	}
+	if strings.Contains(strings.Join(c.fallbackArgs, " "), "android_sdkless") {
+		t.Fatalf("fallback must not force the fast client: %v", c.fallbackArgs)
+	}
+
+	// A user-supplied --extractor-args wins and disables the fallback.
+	c2 := New("x", "", []string{"--extractor-args", "youtube:player_client=web"})
+	if strings.Contains(strings.Join(c2.extraArgs, " "), "android_sdkless") {
+		t.Fatalf("user extractor-args should win: %v", c2.extraArgs)
+	}
+	if c2.fallbackArgs != nil {
+		t.Fatalf("no fallback expected when user sets extractor-args: %v", c2.fallbackArgs)
+	}
+}

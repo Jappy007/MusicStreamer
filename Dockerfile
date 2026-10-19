@@ -21,11 +21,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     -o /out/musicstreamer .
 
 FROM alpine:latest
-# yt-dlp resolves YouTube audio; nodejs is its JS runtime for YouTube's
-# challenges (Alpine's node is >=22, injected as --js-runtimes node at runtime).
-# yt-dlp-ejs-rt-nodejs supplies the prebuilt EJS challenge-solver bundle that
-# the base yt-dlp/yt-dlp-ejs packages do not include (its absence makes
-# extraction hang, then get SIGKILLed with no stderr).
+# yt-dlp resolves YouTube audio. The fast default client (android_sdkless)
+# needs no JS runtime; nodejs + the EJS bundle make the optional JS fallback
+# work for videos the fast client cannot access.
 RUN apk add --no-cache ca-certificates tzdata yt-dlp yt-dlp-ejs-rt-nodejs nodejs \
     && addgroup -S app && adduser -S app -G app \
     && mkdir -p /data/cache && chown -R app:app /data

@@ -21,6 +21,15 @@ Fresh load (no `Range`, or `bytes=0-`), tried in order:
 **Background fetch** (one per track): **Soulseek** lossless first, then
 **YouTube best audio** as the canonical file.
 
+**Pre-resolution while browsing:** when a client lists songs (`search3`,
+`getAlbum`, `getRandomSongs`, `getSong`), the server resolves YouTube URLs for
+the first few tracks in the background. A play then starts immediately without
+paying yt-dlp's lookup latency in the stream request — important because some
+players abort a stream that is slow to send its first byte, then retry. Up to
+`prewarmPerPage` (6) tracks are warmed per list, two lookups at a time; failures
+back off for 10 minutes so list refreshes don't hammer yt-dlp. Resolved URLs
+are memoized for 10 minutes and shared by racing/retried requests.
+
 ### Upgrading a track to lossless
 
 An in-flight stream can't be swapped mid-playback (HTTP range offsets are tied
@@ -33,16 +42,17 @@ server, so it keeps the preview until the track is re-opened.
 
 Song IDs are reversible `base64url(artist\x1falbum\x1ftitle)` — stateless, no DB.
 
-> **yt-dlp, JS runtimes, and freshness:** since late 2025 YouTube's player
-> needs an external **JS runtime** for yt-dlp to solve its challenges. The
-> image ships `nodejs` and the server auto-adds `--js-runtimes node` (or uses
-> `deno` if present), so this works out of the box. YouTube also changes often
-> and may still challenge the server's IP: pass extra flags with `YTDLP_ARGS`,
-> mount cookies via `YTDLP_COOKIES`, or point `YTDLP_PATH` at a newer binary.
-> Diagnosis: `docker compose logs musicstreamer | grep youtube` — resolve
-> failures now include yt-dlp's own stderr (missing runtime, bot check, format
-> unavailable). Without a working `yt-dlp`, playback falls back to **blocking
-> Soulseek** (you'll see the file download on slskd before audio starts).
+> **yt-dlp speed and JS runtimes:** the server defaults to YouTube's
+> `android_sdkless` player client, which needs **no JavaScript runtime** and
+> resolves roughly twice as fast as the web client's JS-challenge path
+> (`--extractor-args youtube:player_client=android_sdkless`, with an automatic
+> retry on the normal JS path if it fails). `nodejs` is still installed in the
+> image so that fallback works. YouTube also changes often and may challenge the
+> server's IP: pass extra flags with `YTDLP_ARGS`, mount cookies via
+> `YTDLP_COOKIES`, or point `YTDLP_PATH` at a newer binary. Diagnosis:
+> `docker compose logs musicstreamer | grep youtube` — resolve failures include
+> yt-dlp's own stderr. Without a working `yt-dlp`, playback falls back to
+> **blocking Soulseek**.
 >
 > The first YouTube lookup after boot pays a one-time cost (loading the JS
 > runtime and challenge solver); a **startup warm-up** (`YOUTUBE_WARMUP`, on by

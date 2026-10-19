@@ -42,6 +42,11 @@ type Server struct {
 	previewFlight flight
 	previewMu     sync.Mutex
 	previewURLs   map[string]previewURL
+	previewFail   map[string]time.Time
+
+	// warmSem bounds concurrent background pre-resolutions so browsing a list
+	// cannot spawn one yt-dlp process per track.
+	warmSem chan struct{}
 
 	// pins remembers, per client connection, which file variant a track's
 	// playback began on, so seeks stay byte-consistent (see singleflight.go).
@@ -77,7 +82,8 @@ func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *y
 	return &Server{
 		user: user, pass: pass,
 		meta: m, soulseek: sk, yt: yt, storage: s, preview: preview,
-		proxy: proxy,
+		proxy:   proxy,
+		warmSem: make(chan struct{}, 2),
 	}
 }
 
@@ -234,6 +240,7 @@ func (s *Server) GetAlbum(w http.ResponseWriter, r *http.Request) {
 		info.Songs = songs
 		info.SongCount = len(songs)
 		resp.Album = info
+		s.prewarmPage(info.Songs)
 		write(w, r, resp)
 		return
 	}
@@ -266,6 +273,7 @@ func (s *Server) GetAlbum(w http.ResponseWriter, r *http.Request) {
 	}
 	info.SongCount = len(info.Songs)
 	resp.Album = info
+	s.prewarmPage(info.Songs)
 	write(w, r, resp)
 }
 
@@ -521,7 +529,9 @@ func (s *Server) Search3(w http.ResponseWriter, r *http.Request) {
 		end = len(entries)
 	}
 	resp := okResponse()
-	resp.SearchResult3 = &SearchResult{Songs: entries[offset:end]}
+	page := entries[offset:end]
+	resp.SearchResult3 = &SearchResult{Songs: page}
+	s.prewarmPage(page)
 	write(w, r, resp)
 }
 
@@ -550,6 +560,7 @@ func (s *Server) RandomSongs(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := okResponse()
 	resp.RandomSongs = &RandomSongs{Songs: songs}
+	s.prewarmPage(songs)
 	write(w, r, resp)
 }
 
@@ -594,6 +605,7 @@ func (s *Server) GetSong(w http.ResponseWriter, r *http.Request) {
 	resp := okResponse()
 	e := songToEntry(m)
 	resp.Song = &e
+	s.prewarmPage([]SongEntry{e})
 	write(w, r, resp)
 }
 
@@ -713,6 +725,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			log.Printf("stream: %q - %q: youtube resolve failed: %v", artist, title, rerr)
+			s.markPreviewFailed(id)
 		} else if st, ok := s.awaitPreviewURL(r.Context(), id, 15*time.Second); ok {
 			// Another request is already resolving this track; reuse it
 			// instead of starting a duplicate yt-dlp run.
@@ -853,6 +866,81 @@ func (s *Server) cachePreview(id string, st ytaudio.Stream) {
 	if err := s.preview.CommitTemp(id, tmpPath); err != nil {
 		log.Printf("stream: preview warm store %s: %v", id, err)
 	}
+}
+
+// prewarmPerPage caps how many listed tracks are pre-resolved per browse
+// request. Kept small: each one is a full yt-dlp search+extract.
+const prewarmPerPage = 6
+
+// prewarmPage resolves preview URLs for the first few tracks of a list the
+// client is about to display. By the time the user presses play, the URL is
+// usually ready, so playback starts immediately instead of paying yt-dlp's
+// latency in the stream request (which some clients abort while waiting).
+// Only the URL is memoized; the preview file caches on first play.
+func (s *Server) prewarmPage(songs []SongEntry) {
+	if s.yt == nil || !s.yt.Enabled() || s.warmSem == nil {
+		return
+	}
+	n := len(songs)
+	if n > prewarmPerPage {
+		n = prewarmPerPage
+	}
+	for i := 0; i < n; i++ {
+		s.prewarmPreview(songs[i])
+	}
+}
+
+func (s *Server) prewarmPreview(e SongEntry) {
+	id := e.ID
+	if id == "" || strings.TrimSpace(e.Title) == "" {
+		return
+	}
+	if s.storage != nil {
+		if _, ok := s.storage.Lookup(id); ok {
+			return
+		}
+	}
+	if s.preview != nil {
+		if _, ok := s.preview.Lookup(id); ok {
+			return
+		}
+	}
+	if _, ok := s.cachedPreviewURL(id); ok {
+		return
+	}
+	if s.previewFailed(id) {
+		return
+	}
+	go func() {
+		s.warmSem <- struct{}{}
+		defer func() { <-s.warmSem }()
+		// Re-check: another request may have resolved it while we queued.
+		if _, ok := s.cachedPreviewURL(id); ok {
+			return
+		}
+		if s.preview != nil {
+			if _, ok := s.preview.Lookup(id); ok {
+				return
+			}
+		}
+		if s.previewFailed(id) {
+			return
+		}
+		if !s.previewFlight.begin(id) {
+			return
+		}
+		defer s.previewFlight.finish(id)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		st, err := s.yt.Resolve(ctx, e.Artist, e.Title, false)
+		if err != nil {
+			log.Printf("prewarm: %q - %q: %v", e.Artist, e.Title, err)
+			s.markPreviewFailed(id)
+			return
+		}
+		s.rememberPreviewURL(id, st)
+		log.Printf("prewarm: %q - %q: url ready", e.Artist, e.Title)
+	}()
 }
 
 // startFullFetch fetches the canonical (lossless-preferred) file into the full

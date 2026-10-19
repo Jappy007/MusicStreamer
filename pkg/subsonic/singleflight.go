@@ -67,6 +67,42 @@ func (s *Server) rememberPreviewURL(id string, st ytaudio.Stream) {
 		}
 	}
 	s.previewURLs[id] = previewURL{st: st, exp: now.Add(previewURLTTL)}
+	delete(s.previewFail, id)
+}
+
+// previewFailTTL is how long a failed lookup suppresses retries, so repeated
+// list refreshes do not re-run yt-dlp for a track that just failed.
+const previewFailTTL = 10 * time.Minute
+
+// markPreviewFailed records that resolving id failed, to back off briefly.
+func (s *Server) markPreviewFailed(id string) {
+	s.previewMu.Lock()
+	defer s.previewMu.Unlock()
+	now := time.Now()
+	if s.previewFail == nil {
+		s.previewFail = make(map[string]time.Time)
+	}
+	for k, t := range s.previewFail {
+		if now.Sub(t) > previewFailTTL {
+			delete(s.previewFail, k)
+		}
+	}
+	s.previewFail[id] = now
+}
+
+// previewFailed reports whether id failed to resolve recently.
+func (s *Server) previewFailed(id string) bool {
+	s.previewMu.Lock()
+	defer s.previewMu.Unlock()
+	t, ok := s.previewFail[id]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > previewFailTTL {
+		delete(s.previewFail, id)
+		return false
+	}
+	return true
 }
 
 // cachedPreviewURL returns a still-valid resolved URL for id.

@@ -35,9 +35,8 @@ services:
       # one-time challenge-solver setup.
       YOUTUBE_WARMUP: ${YOUTUBE_WARMUP:-true}
       YTDLP_PATH: ${YTDLP_PATH:-yt-dlp}
-      # Extra yt-dlp flags (whitespace-separated), e.g. "--extractor-args
-      # youtube:player_client=tv". A JS runtime is auto-selected (image ships
-      # nodejs); override with --js-runtimes if needed.
+      # Extra yt-dlp flags (whitespace-separated). Defaults to the fast JS-less
+      # client (android_sdkless); setting --extractor-args overrides it.
       YTDLP_ARGS: ${YTDLP_ARGS:-}
       # Optional cookies file (YouTube bot-check escape hatch); mount it and
       # set YTDLP_COOKIES=/data/cookies.txt.
