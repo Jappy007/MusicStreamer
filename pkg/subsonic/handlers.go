@@ -36,6 +36,13 @@ type Server struct {
 	// fetchFlight coalesces background canonical fetches (one per song id).
 	fetchFlight flight
 
+	// previewFlight coalesces concurrent YouTube preview lookups per song id,
+	// and previewURLs remembers fresh resolved URLs briefly so a client that
+	// aborts its request mid-lookup (a probe/retry) gets the next one instantly.
+	previewFlight flight
+	previewMu     sync.Mutex
+	previewURLs   map[string]previewURL
+
 	// pins remembers, per client connection, which file variant a track's
 	// playback began on, so seeks stay byte-consistent (see singleflight.go).
 	pinMu sync.Mutex
@@ -672,25 +679,49 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 
 	// Tier 3: resolve a fresh YouTube preview and stream it now.
 	if s.yt != nil && s.yt.Enabled() {
-		// Detached from the client context: a client that gives up early
-		// (common on a cold YouTube lookup) must not abort a resolve that is
-		// nearly done — the result is still cached for its retry.
-		rctx, rcancel := context.WithTimeout(context.Background(), 90*time.Second)
-		st, rerr := s.yt.Resolve(rctx, artist, title, false)
-		rcancel()
-		if rerr == nil {
+		// A URL resolved moments ago (possibly for a request the client
+		// abandoned) skips yt-dlp entirely.
+		if st, ok := s.cachedPreviewURL(id); ok {
+			log.Printf("stream: %q - %q: tier=youtube preview (recent url)", artist, title)
 			s.pin(r.RemoteAddr, id, variantPreview)
-			if r.Context().Err() != nil {
-				log.Printf("stream: %q - %q: client left during resolve; caching preview for the retry", artist, title)
-				go s.cachePreview(id, st)
-			} else {
-				log.Printf("stream: %q - %q: tier=youtube preview", artist, title)
-				s.servePreview(w, r, id, st)
-			}
+			s.servePreview(w, r, id, st)
 			go s.startFullFetch(id, artist, album, title)
 			return
 		}
-		log.Printf("stream: %q - %q: youtube resolve failed: %v", artist, title, rerr)
+
+		if s.previewFlight.begin(id) {
+			// Detached from the client context: a client that gives up early
+			// (common on a cold YouTube lookup) must not abort a resolve that
+			// is nearly done — the result is still cached for its retry.
+			rctx, rcancel := context.WithTimeout(context.Background(), 90*time.Second)
+			st, rerr := s.yt.Resolve(rctx, artist, title, false)
+			rcancel()
+			if rerr == nil {
+				s.rememberPreviewURL(id, st)
+			}
+			s.previewFlight.finish(id)
+			if rerr == nil {
+				s.pin(r.RemoteAddr, id, variantPreview)
+				if r.Context().Err() != nil {
+					log.Printf("stream: %q - %q: client left during resolve; caching preview for the retry", artist, title)
+					go s.cachePreview(id, st)
+				} else {
+					log.Printf("stream: %q - %q: tier=youtube preview", artist, title)
+					s.servePreview(w, r, id, st)
+				}
+				go s.startFullFetch(id, artist, album, title)
+				return
+			}
+			log.Printf("stream: %q - %q: youtube resolve failed: %v", artist, title, rerr)
+		} else if st, ok := s.awaitPreviewURL(r.Context(), id, 15*time.Second); ok {
+			// Another request is already resolving this track; reuse it
+			// instead of starting a duplicate yt-dlp run.
+			log.Printf("stream: %q - %q: tier=youtube preview (coalesced)", artist, title)
+			s.pin(r.RemoteAddr, id, variantPreview)
+			s.servePreview(w, r, id, st)
+			go s.startFullFetch(id, artist, album, title)
+			return
+		}
 	}
 
 	// Tier 4: blocking Soulseek — no preview available.

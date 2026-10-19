@@ -197,13 +197,20 @@ func resolveArgs(query string, best bool, cookies string, extra []string) []stri
 	return args
 }
 
-// firstURL returns the first non-empty line of yt-dlp's -g output.
+// firstURL returns the first direct, streamable URL from yt-dlp's -g output.
+// HLS manifests (.m3u8) are skipped: they are playlists, not media, and would
+// be truncated/cached as garbage by the caller. If only a manifest is offered,
+// no URL is returned (the caller falls back to its other source).
 func firstURL(out string) string {
 	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			return line
+		u := strings.TrimSpace(line)
+		if !strings.HasPrefix(u, "http") {
+			continue
 		}
+		if strings.Contains(u, ".m3u8") || strings.Contains(u, "manifest.googlevideo.com") {
+			continue
+		}
+		return u
 	}
 	return ""
 }

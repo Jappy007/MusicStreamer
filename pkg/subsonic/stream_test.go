@@ -2,6 +2,7 @@ package subsonic
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -152,5 +153,35 @@ func TestServePreviewFullAndRange(t *testing.T) {
 	}
 	if _, ok := prev.Lookup(id2); ok {
 		t.Fatal("range response must not be cached")
+	}
+}
+
+func TestPreviewURLMemo(t *testing.T) {
+	s := &Server{}
+	st := ytaudio.Stream{URL: "https://example/x", ContentType: "audio/mp4"}
+
+	if _, ok := s.cachedPreviewURL("a"); ok {
+		t.Fatal("unexpected initial hit")
+	}
+	s.rememberPreviewURL("a", st)
+	got, ok := s.cachedPreviewURL("a")
+	if !ok || got.URL != st.URL || got.ContentType != st.ContentType {
+		t.Fatalf("memo miss: %+v ok=%v", got, ok)
+	}
+
+	// awaitPreviewURL polls until another request publishes the result.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s.rememberPreviewURL("b", st)
+	}()
+	if got, ok := s.awaitPreviewURL(context.Background(), "b", time.Second); !ok || got.URL != st.URL {
+		t.Fatalf("await failed: %+v ok=%v", got, ok)
+	}
+
+	// It gives up when the caller's context is cancelled.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := s.awaitPreviewURL(ctx, "missing", 5*time.Second); ok {
+		t.Fatal("await should stop on cancelled context")
 	}
 }

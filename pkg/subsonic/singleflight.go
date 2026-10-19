@@ -1,8 +1,11 @@
 package subsonic
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/musicstreamer/musicstreamer/pkg/ytaudio"
 )
 
 // flight coalesces concurrent work by key: the first caller for a key becomes
@@ -35,6 +38,65 @@ func (f *flight) finish(key string) {
 	f.mu.Lock()
 	delete(f.m, key)
 	f.mu.Unlock()
+}
+
+// --- short-lived resolved-preview-URL memo --------------------------------
+
+// previewURLTTL bounds how long a resolved YouTube URL is reused. The upstream
+// URL itself expires after several hours; 10 minutes is deliberately short and
+// only needs to cover a client's probe-then-retry or a quick replay.
+const previewURLTTL = 10 * time.Minute
+
+type previewURL struct {
+	st  ytaudio.Stream
+	exp time.Time
+}
+
+// rememberPreviewURL stores a freshly resolved URL for id and purges expired
+// entries while it is there.
+func (s *Server) rememberPreviewURL(id string, st ytaudio.Stream) {
+	s.previewMu.Lock()
+	defer s.previewMu.Unlock()
+	now := time.Now()
+	if s.previewURLs == nil {
+		s.previewURLs = make(map[string]previewURL)
+	}
+	for k, e := range s.previewURLs {
+		if now.After(e.exp) {
+			delete(s.previewURLs, k)
+		}
+	}
+	s.previewURLs[id] = previewURL{st: st, exp: now.Add(previewURLTTL)}
+}
+
+// cachedPreviewURL returns a still-valid resolved URL for id.
+func (s *Server) cachedPreviewURL(id string) (ytaudio.Stream, bool) {
+	s.previewMu.Lock()
+	defer s.previewMu.Unlock()
+	e, ok := s.previewURLs[id]
+	if !ok || time.Now().After(e.exp) {
+		return ytaudio.Stream{}, false
+	}
+	return e.st, true
+}
+
+// awaitPreviewURL waits up to max for another request's in-flight resolve of id
+// to publish its URL, so racing/probing requests do not each spawn yt-dlp.
+func (s *Server) awaitPreviewURL(ctx context.Context, id string, max time.Duration) (ytaudio.Stream, bool) {
+	deadline := time.Now().Add(max)
+	for {
+		if st, ok := s.cachedPreviewURL(id); ok {
+			return st, true
+		}
+		if time.Now().After(deadline) {
+			return ytaudio.Stream{}, false
+		}
+		select {
+		case <-ctx.Done():
+			return ytaudio.Stream{}, false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // --- per-connection stream variant pinning --------------------------------

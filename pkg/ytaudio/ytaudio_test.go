@@ -47,6 +47,15 @@ func TestFirstURL(t *testing.T) {
 	if got := firstURL("   "); got != "" {
 		t.Fatalf("firstURL empty = %q", got)
 	}
+	// HLS manifest first, then a direct URL: the manifest must be skipped.
+	out := "https://manifest.googlevideo.com/api/manifest/hls_playlist/index.m3u8\nhttps://rr2.googlevideo.com/videoplayback?itag=251"
+	if got := firstURL(out); got != "https://rr2.googlevideo.com/videoplayback?itag=251" {
+		t.Fatalf("manifest not skipped: %q", got)
+	}
+	// Manifest-only output yields nothing rather than a playlist URL.
+	if got := firstURL("https://x/y/index.m3u8"); got != "" {
+		t.Fatalf("manifest-only = %q", got)
+	}
 }
 
 func TestContentTypeForURL(t *testing.T) {
