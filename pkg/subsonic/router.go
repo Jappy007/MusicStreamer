@@ -17,6 +17,19 @@ func Route(mux *http.ServeMux, s *Server) {
 		mux.HandleFunc(pattern+".view", h) // some routers strip suffix first
 	}
 
+	// Navidrome native API (used by Psysonic and other Navidrome-first clients).
+	mux.HandleFunc("/auth/login", s.NativeLogin)
+	mux.HandleFunc("/api/keepalive/keepalive", s.NativeKeepalive)
+	mux.HandleFunc("/api/song", s.NativeSongs)
+	mux.HandleFunc("/api/song/", s.NativeSongSub)
+	mux.HandleFunc("/api/album", s.NativeAlbums)
+	mux.HandleFunc("/api/album/", s.NativeAlbumSub)
+	mux.HandleFunc("/api/artist", s.NativeArtists)
+	mux.HandleFunc("/api/artist/", s.NativeArtistSub)
+	mux.HandleFunc("/api/library", s.NativeLibraries)
+	mux.HandleFunc("/api/playlist/", s.NativeMissingImage)
+	mux.HandleFunc("/api/radio/", s.NativeMissingImage)
+
 	// Required.
 	bind("/rest/ping", s.Ping)
 	bind("/rest/getLicense", s.License)
@@ -145,7 +158,8 @@ func WithCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, X-ND-Authorization, X-ND-Client-Unique-Id, X-ND-Version, Range")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Total-Count, Content-Range, Content-Length, Accept-Ranges")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

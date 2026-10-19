@@ -28,8 +28,10 @@ type Client struct {
 
 // Stream is a resolved audio source.
 type Stream struct {
-	URL         string
-	ContentType string
+	URL          string
+	ContentType  string
+	VideoID      string
+	ThumbnailURL string
 }
 
 // New builds a resolver for the given yt-dlp binary. bin may be empty to use
@@ -139,11 +141,49 @@ func (c *Client) try(ctx context.Context, query string, best bool, extra []strin
 	if err != nil {
 		return Stream{}, fmt.Errorf("ytaudio: %w%s", err, failureDetail(ctx, err))
 	}
-	raw := firstURL(string(out))
-	if raw == "" {
+	st := parseStream(string(out))
+	if st.URL == "" {
 		return Stream{}, errors.New("ytaudio: no url resolved")
 	}
-	return Stream{URL: raw, ContentType: contentTypeForURL(raw)}, nil
+	return st, nil
+}
+
+func parseStream(out string) Stream {
+	var st Stream
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "__MSID__"):
+			st.VideoID = cleanMetadata(strings.TrimPrefix(line, "__MSID__"))
+		case strings.HasPrefix(line, "__MSTHUMB__"):
+			st.ThumbnailURL = cleanMetadata(strings.TrimPrefix(line, "__MSTHUMB__"))
+		}
+	}
+	st.URL = firstURL(out)
+	if st.URL != "" {
+		st.ContentType = contentTypeForURL(st.URL)
+	}
+	if st.ThumbnailURL == "" && st.VideoID != "" {
+		st.ThumbnailURL = ThumbnailURLForVideo(st.VideoID)
+	}
+	return st
+}
+
+func cleanMetadata(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "NA" || v == "None" {
+		return ""
+	}
+	return v
+}
+
+// ThumbnailURLForVideo returns a stable YouTube thumbnail for a video id.
+func ThumbnailURLForVideo(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg"
 }
 
 // failureDetail explains a yt-dlp failure. It prefers yt-dlp's own stderr
@@ -188,6 +228,8 @@ func resolveArgs(query string, best bool, cookies string, extra []string) []stri
 		"--no-warnings",
 		"--no-progress",
 		"-f", format,
+		"--print", "__MSID__%(id)s",
+		"--print", "__MSTHUMB__%(thumbnail)s",
 		"-g",
 	}
 	if cookies != "" {

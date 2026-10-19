@@ -24,6 +24,7 @@ type Info struct {
 	BitDepth   int    // bits per sample (lossless only)
 	Channels   int
 	BitRate    int // kbps (MP3 only; 0 when unknown)
+	Duration   int // seconds (0 when unknown)
 }
 
 // ErrUnknown is returned when the file is not a recognized audio format.
@@ -49,23 +50,23 @@ func probe(f *os.File, b []byte) (Info, error) {
 	case len(b) >= 4 && string(b[:4]) == "fLaC":
 		return probeFLAC(b)
 	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WAVE":
-		return probeWAV(b)
+		return probeWAV(f, b)
 	case len(b) >= 12 && string(b[:4]) == "FORM" &&
 		(string(b[8:12]) == "AIFF" || string(b[8:12]) == "AIFC"):
 		return probeAIFF(b)
 	case len(b) >= 4 && string(b[:4]) == "OggS":
-		return probeOgg(b), nil
+		return probeOgg(f, b), nil
 	case len(b) >= 8 && string(b[4:8]) == "ftyp":
 		return probeMP4(f)
 	case len(b) >= 3 && string(b[:3]) == "ID3":
 		if off := id3v2Size(b); off >= 0 && off < len(b) {
-			if info, ok := probeMP3(b[off:]); ok {
+			if info, ok := probeMP3File(f, b, off); ok {
 				return info, nil
 			}
 		}
 		return Info{Format: "mp3"}, nil
 	case len(b) >= 2 && b[0] == 0xFF:
-		if info, ok := probeMP3(b); ok {
+		if info, ok := probeMP3File(f, b, 0); ok {
 			return info, nil
 		}
 		if b[1]&0xF0 == 0xF0 {
@@ -90,11 +91,18 @@ func probeFLAC(b []byte) (Info, error) {
 				break
 			}
 			v := binary.BigEndian.Uint64(b[off+4+10 : off+4+18])
+			sr := int(v >> 44)
+			total := v & ((1 << 36) - 1)
+			duration := 0
+			if sr > 0 && total > 0 {
+				duration = int((total + uint64(sr)/2) / uint64(sr))
+			}
 			return Info{
 				Format:     "flac",
-				SampleRate: int(v >> 44),
+				SampleRate: sr,
 				BitDepth:   int((v>>36)&0x1F) + 1,
 				Channels:   int((v>>41)&0x7) + 1,
+				Duration:   duration,
 			}, nil
 		}
 		off += 4 + length
@@ -107,26 +115,63 @@ func probeFLAC(b []byte) (Info, error) {
 
 // --- WAV ------------------------------------------------------------------
 
-func probeWAV(b []byte) (Info, error) {
+func probeWAV(f *os.File, b []byte) (Info, error) {
+	info := Info{Format: "wav"}
+	byteRate := int64(0)
+	dataOff := int64(-1)
+	dataSize := int64(-1)
 	off := 12
 	for off+8 <= len(b) {
 		id := string(b[off : off+4])
-		sz := int(binary.LittleEndian.Uint32(b[off+4 : off+8]))
+		sz := int64(binary.LittleEndian.Uint32(b[off+4 : off+8]))
 		if id == "fmt " && off+8+16 <= len(b) {
 			d := b[off+8:]
-			return Info{
-				Format:     "wav",
-				Channels:   int(binary.LittleEndian.Uint16(d[2:4])),
-				SampleRate: int(binary.LittleEndian.Uint32(d[4:8])),
-				BitDepth:   int(binary.LittleEndian.Uint16(d[14:16])),
-			}, nil
+			info.Channels = int(binary.LittleEndian.Uint16(d[2:4]))
+			info.SampleRate = int(binary.LittleEndian.Uint32(d[4:8]))
+			byteRate = int64(binary.LittleEndian.Uint32(d[8:12]))
+			info.BitDepth = int(binary.LittleEndian.Uint16(d[14:16]))
+		}
+		if id == "data" {
+			dataOff = int64(off + 8)
+			dataSize = sz
+			break
 		}
 		if sz < 0 {
 			break
 		}
-		off += 8 + sz + (sz & 1)
+		off += 8 + int(sz) + int(sz&1)
 	}
-	return Info{Format: "wav"}, nil
+	if dataOff < 0 {
+		dataOff, dataSize = findWAVData(f)
+	}
+	if size := fileSize(f); dataOff >= 0 && byteRate > 0 {
+		if dataSize <= 0 || dataOff+dataSize > size {
+			dataSize = size - dataOff
+		}
+		if dataSize > 0 {
+			info.Duration = int((dataSize + byteRate/2) / byteRate)
+		}
+	}
+	return info, nil
+}
+
+func findWAVData(f *os.File) (int64, int64) {
+	size := fileSize(f)
+	for off := int64(12); off+8 <= size; {
+		var hdr [8]byte
+		if _, err := f.ReadAt(hdr[:], off); err != nil {
+			break
+		}
+		sz := int64(binary.LittleEndian.Uint32(hdr[4:8]))
+		if string(hdr[:4]) == "data" {
+			return off + 8, sz
+		}
+		off += 8 + sz + (sz & 1)
+		if sz < 0 {
+			break
+		}
+	}
+	return -1, -1
 }
 
 // --- AIFF -----------------------------------------------------------------
@@ -138,11 +183,18 @@ func probeAIFF(b []byte) (Info, error) {
 		sz := int(binary.BigEndian.Uint32(b[off+4 : off+8]))
 		if id == "COMM" && off+8+18 <= len(b) {
 			d := b[off+8:]
+			frames := binary.BigEndian.Uint32(d[2:6])
+			sr := extFloat(d[8:18])
+			duration := 0
+			if sr > 0 && frames > 0 {
+				duration = int((uint64(frames) + uint64(sr)/2) / uint64(sr))
+			}
 			return Info{
 				Format:     "aiff",
 				Channels:   int(binary.BigEndian.Uint16(d[0:2])),
 				BitDepth:   int(binary.BigEndian.Uint16(d[6:8])),
-				SampleRate: extFloat(d[8:18]),
+				SampleRate: sr,
+				Duration:   duration,
 			}, nil
 		}
 		if sz < 0 {
@@ -168,32 +220,109 @@ func extFloat(b []byte) int {
 
 // --- Ogg (Vorbis / Opus) --------------------------------------------------
 
-func probeOgg(b []byte) Info {
+func probeOgg(f *os.File, b []byte) Info {
+	var info Info
 	if i := bytes.Index(b, []byte("OpusHead")); i >= 0 && i+16 <= len(b) {
-		return Info{
+		info = Info{
 			Format:     "opus",
 			Channels:   int(b[i+9]),
 			SampleRate: int(binary.LittleEndian.Uint32(b[i+12 : i+16])),
 		}
-	}
-	if i := bytes.Index(b, []byte("vorbis")); i >= 0 && i+15 <= len(b) {
-		return Info{
+	} else if i := bytes.Index(b, []byte("vorbis")); i >= 0 && i+15 <= len(b) {
+		info = Info{
 			Format:     "ogg",
 			Channels:   int(b[i+10]),
 			SampleRate: int(binary.LittleEndian.Uint32(b[i+11 : i+15])),
 		}
+	} else {
+		info = Info{Format: "ogg"}
 	}
-	return Info{Format: "ogg"}
+	if granule, ok := oggLastGranule(f); ok {
+		sr := info.SampleRate
+		if info.Format == "opus" {
+			sr = 48000
+		}
+		if sr > 0 {
+			info.Duration = int((granule + uint64(sr)/2) / uint64(sr))
+		}
+	}
+	return info
+}
+
+func oggLastGranule(f *os.File) (uint64, bool) {
+	size := fileSize(f)
+	if size <= 0 {
+		return 0, false
+	}
+	n := int64(64 << 10)
+	if n > size {
+		n = size
+	}
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, size-n); err != nil {
+		return 0, false
+	}
+	for end := len(buf); end >= 27; {
+		i := bytes.LastIndex(buf[:end], []byte("OggS"))
+		if i < 0 {
+			break
+		}
+		if i+27 > len(buf) {
+			end = i
+			continue
+		}
+		nseg := int(buf[i+26])
+		if i+27+nseg > len(buf) {
+			end = i
+			continue
+		}
+		pageLen := 27 + nseg
+		for _, lace := range buf[i+27 : i+27+nseg] {
+			pageLen += int(lace)
+		}
+		if i+pageLen > len(buf) {
+			end = i
+			continue
+		}
+		granule := binary.LittleEndian.Uint64(buf[i+6 : i+14])
+		if granule != ^uint64(0) {
+			return granule, true
+		}
+		end = i
+	}
+	return 0, false
 }
 
 // --- MP3 / MPEG audio -----------------------------------------------------
 
-func probeMP3(b []byte) (Info, bool) {
-	limit := len(b)
-	if limit > 8192 {
-		limit = 8192
+type mp3Frame struct {
+	info     Info
+	off      int
+	size     int
+	samples  int
+	ver      int
+	layer    int
+	channels int
+}
+
+func probeMP3File(f *os.File, b []byte, start int) (Info, bool) {
+	fr, ok := parseMP3Frame(b, start)
+	if !ok {
+		return Info{}, false
 	}
-	for i := 0; i+4 <= limit; i++ {
+	fr.info.Duration = mp3Duration(f, b, start, fr)
+	return fr.info, true
+}
+
+func parseMP3Frame(b []byte, start int) (mp3Frame, bool) {
+	if start < 0 {
+		start = 0
+	}
+	limit := len(b)
+	if limit > start+8192 {
+		limit = start + 8192
+	}
+	for i := start; i+4 <= limit; i++ {
 		if b[i] != 0xFF || b[i+1]&0xE0 != 0xE0 {
 			continue
 		}
@@ -202,6 +331,7 @@ func probeMP3(b []byte) (Info, bool) {
 		layer := int((h >> 17) & 0x3) // 0=reserved 1=L3 2=L2 3=L1
 		brIdx := int((h >> 12) & 0xF)
 		srIdx := int((h >> 10) & 0x3)
+		padding := int((h >> 9) & 0x1)
 		if ver == 1 || layer == 0 || brIdx == 0xF || srIdx == 3 {
 			continue
 		}
@@ -220,18 +350,95 @@ func probeMP3(b []byte) (Info, bool) {
 		case 2: // MPEG 2
 			sr /= 2
 		}
+		layerNum := 4 - layer
 		ch := 2
 		if (h>>6)&0x3 == 3 {
 			ch = 1
 		}
-		return Info{
-			Format:     "mp3",
-			SampleRate: sr,
-			Channels:   ch,
-			BitRate:    mp3Bitrate(ver, 4-layer, brIdx),
+		bitrate := mp3Bitrate(ver, layerNum, brIdx)
+		if sr <= 0 || bitrate <= 0 {
+			continue
+		}
+		samples := mp3SamplesPerFrame(ver, layerNum)
+		frameLen := samples / 8 * bitrate * 1000 / sr
+		if layerNum == 1 {
+			frameLen += padding * 4
+		} else {
+			frameLen += padding
+		}
+		if frameLen <= 4 {
+			continue
+		}
+		return mp3Frame{
+			info: Info{
+				Format:     "mp3",
+				SampleRate: sr,
+				Channels:   ch,
+				BitRate:    bitrate,
+			},
+			off:      i,
+			size:     frameLen,
+			samples:  samples,
+			ver:      ver,
+			layer:    layerNum,
+			channels: ch,
 		}, true
 	}
-	return Info{}, false
+	return mp3Frame{}, false
+}
+
+func mp3SamplesPerFrame(ver, layerNum int) int {
+	switch layerNum {
+	case 1:
+		return 384
+	case 2:
+		return 1152
+	case 3:
+		if ver == 3 {
+			return 1152
+		}
+		return 576
+	}
+	return 0
+}
+
+func mp3Duration(f *os.File, b []byte, start int, fr mp3Frame) int {
+	side := 32
+	if fr.channels == 1 {
+		side = 17
+	}
+	if fr.ver != 3 {
+		if fr.channels == 1 {
+			side = 9
+		} else {
+			side = 17
+		}
+	}
+	// Xing/Info VBR header.
+	xing := fr.off + 4 + side
+	if xing+8 <= len(b) && (string(b[xing:xing+4]) == "Xing" || string(b[xing:xing+4]) == "Info") {
+		flags := binary.BigEndian.Uint32(b[xing+4 : xing+8])
+		if flags&1 != 0 && xing+12 <= len(b) {
+			frames := binary.BigEndian.Uint32(b[xing+8 : xing+12])
+			if frames > 0 && fr.info.SampleRate > 0 {
+				return int((uint64(frames)*uint64(fr.samples) + uint64(fr.info.SampleRate)/2) / uint64(fr.info.SampleRate))
+			}
+		}
+	}
+	// Fraunhofer VBRI header.
+	vbri := fr.off + 4 + 32
+	if vbri+18 <= len(b) && string(b[vbri:vbri+4]) == "VBRI" {
+		frames := binary.BigEndian.Uint32(b[vbri+14 : vbri+18])
+		if frames > 0 && fr.info.SampleRate > 0 {
+			return int((uint64(frames)*uint64(fr.samples) + uint64(fr.info.SampleRate)/2) / uint64(fr.info.SampleRate))
+		}
+	}
+	// Constant-bitrate stream: derive duration from the remaining file size.
+	if size := fileSize(f); size > int64(start) && fr.info.BitRate > 0 {
+		audioBytes := size - int64(start)
+		return int((audioBytes*8 + int64(fr.info.BitRate)*500) / (int64(fr.info.BitRate) * 1000))
+	}
+	return 0
 }
 
 func mp3Bitrate(ver, layerNum, idx int) int {
@@ -324,6 +531,7 @@ func probeMP4(f *os.File) (Info, error) {
 	if !found {
 		return Info{Format: "m4a"}, nil
 	}
+	duration := mp4Duration(f, moov)
 	// Walk every trak; return the first audio sample description we recognize.
 	end := moov.off + moov.size
 	for off := moov.off + 8; off+8 <= end; {
@@ -333,6 +541,7 @@ func probeMP4(f *os.File) (Info, error) {
 		}
 		if b.typ == "trak" {
 			if info, ok := mp4TrakInfo(f, b); ok {
+				info.Duration = duration
 				return info, nil
 			}
 		}
@@ -341,7 +550,32 @@ func probeMP4(f *os.File) (Info, error) {
 		}
 		off += b.size
 	}
-	return Info{Format: "m4a"}, nil
+	return Info{Format: "m4a", Duration: duration}, nil
+}
+
+func mp4Duration(f *os.File, moov box) int {
+	mvhd, ok := findChild(f, moov, "mvhd")
+	if !ok {
+		return 0
+	}
+	var body [32]byte
+	if _, err := f.ReadAt(body[:], mvhd.off+8); err != nil {
+		return 0
+	}
+	version := body[0]
+	var timescale uint32
+	var duration uint64
+	if version == 1 {
+		timescale = binary.BigEndian.Uint32(body[20:24])
+		duration = binary.BigEndian.Uint64(body[24:32])
+	} else {
+		timescale = binary.BigEndian.Uint32(body[12:16])
+		duration = uint64(binary.BigEndian.Uint32(body[16:20]))
+	}
+	if timescale == 0 || duration == 0 {
+		return 0
+	}
+	return int((duration + uint64(timescale)/2) / uint64(timescale))
 }
 
 func mp4TrakInfo(f *os.File, trak box) (Info, bool) {
@@ -403,6 +637,14 @@ func mp4AlacCookie(f *os.File, base int64) int {
 }
 
 // --- helpers --------------------------------------------------------------
+
+func fileSize(f *os.File) int64 {
+	st, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+	return st.Size()
+}
 
 // id3v2Size returns the total length of a leading ID3v2 tag (header + body).
 func id3v2Size(b []byte) int {

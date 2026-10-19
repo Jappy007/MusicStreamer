@@ -115,6 +115,7 @@ func (s *Server) cachedEntry(cs cachedSong) SongEntry {
 		e.SamplingRate = info.SampleRate
 		e.BitDepth = info.BitDepth
 		e.ChannelCount = info.Channels
+		e.Duration = info.Duration
 		if info.BitRate > 0 {
 			e.BitRate = info.BitRate
 		}

@@ -31,6 +31,7 @@ type Server struct {
 	yt       *ytaudio.Client
 	storage  *cache.Manager
 	preview  *cache.Manager
+	artwork  *cache.Manager
 	lib      *library.Store
 
 	// proxy performs upstream GETs (cover art, YouTube audio previews). No
@@ -61,6 +62,27 @@ type Server struct {
 	// per cached song id; size invalidates the entry on re-download.
 	infoMu sync.Mutex
 	info   map[string]infoCache
+
+	// Artwork resolution is cached on disk and coalesced per cover key.
+	coverMu     sync.Mutex
+	coverThumbs map[string]string
+	coverFail   map[string]coverFailure
+	coverJobs   map[string]*coverJob
+	coverSem    chan struct{}
+
+	// Native API bearer tokens (issued by /auth/login).
+	nativeMu     sync.Mutex
+	nativeTokens map[string]nativeSession
+}
+
+type coverFailure struct {
+	status int
+	exp    time.Time
+}
+
+type coverJob struct {
+	done   chan struct{}
+	status int
 }
 
 // infoCache stores a probed track's properties alongside the file size they
@@ -73,7 +95,8 @@ type infoCache struct {
 // NewServer builds a handler set. proxy may be nil (a default is used).
 // sk and yt may be nil (disables the Soulseek and YouTube preview sources).
 // preview may be nil (disables lossy instant-playback caching).
-func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *ytaudio.Client, s *cache.Manager, preview *cache.Manager, lib *library.Store, proxy *http.Client) *Server {
+// artwork may be nil (cover requests then fail with 503).
+func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *ytaudio.Client, s *cache.Manager, preview, artwork *cache.Manager, lib *library.Store, proxy *http.Client) *Server {
 	if proxy == nil {
 		proxy = &http.Client{
 			Transport: &http.Transport{
@@ -85,9 +108,10 @@ func NewServer(user, pass string, m *metadata.Client, sk *soulseek.Client, yt *y
 	}
 	return &Server{
 		user: user, pass: pass,
-		meta: m, soulseek: sk, yt: yt, storage: s, preview: preview, lib: lib,
-		proxy:   proxy,
-		warmSem: make(chan struct{}, 2),
+		meta: m, soulseek: sk, yt: yt, storage: s, preview: preview, artwork: artwork, lib: lib,
+		proxy:    proxy,
+		warmSem:  make(chan struct{}, 2),
+		coverSem: make(chan struct{}, 4),
 	}
 }
 
@@ -284,67 +308,17 @@ func (s *Server) GetAlbum(w http.ResponseWriter, r *http.Request) {
 	write(w, r, resp)
 }
 
-// CoverArt proxies the Deezer/MusicBrainz artwork for a song/album/artist
-// ID. Cover IDs are our own song/album IDs, so decode -> metadata search ->
-// stream the upstream image bytes (capped, timed out). No caching: CDN hits
-// are cheap and this keeps the audio LRU accounting pure.
+// CoverArt serves artwork for a song/album/artist ID. Artwork is resolved
+// once (metadata first, then the track's YouTube thumbnail), validated, and
+// cached on disk. Importantly, failures use real HTTP error statuses: clients
+// such as Psysonic cache any 2xx body as an image and would otherwise keep a
+// broken XML response forever.
 func (s *Server) CoverArt(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(w, r) {
 		return
 	}
 	_ = r.ParseForm()
-	id := firstOf(r.Form, "id")
-	artist, album, title, err := metadata.SplitID(id)
-	if err != nil {
-		writeFail(w, r, 70, "Cover art not found")
-		return
-	}
-	query := strings.TrimSpace(strings.TrimSpace(artist+" "+album) + " " + title)
-	if query == "" {
-		writeFail(w, r, 70, "Cover art not found")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
-	defer cancel()
-	songs, err := s.meta.Search(ctx, query, 5)
-	if err != nil {
-		writeFail(w, r, 70, "Cover art not found")
-		return
-	}
-	coverURL := ""
-	for _, m := range songs {
-		if m.CoverURL != "" {
-			coverURL = m.CoverURL
-			break
-		}
-	}
-	if coverURL == "" {
-		writeFail(w, r, 70, "Cover art not found")
-		return
-	}
-	ictx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ictx, http.MethodGet, coverURL, nil)
-	if err != nil {
-		writeFail(w, r, 70, "Cover art not found")
-		return
-	}
-	upResp, err := s.proxy.Do(req)
-	if err != nil || upResp.StatusCode != http.StatusOK {
-		if upResp != nil {
-			_ = upResp.Body.Close()
-		}
-		writeFail(w, r, 70, "Cover art not found")
-		return
-	}
-	defer upResp.Body.Close()
-	ctype := upResp.Header.Get("Content-Type")
-	if ctype == "" {
-		ctype = "image/jpeg"
-	}
-	w.Header().Set("Content-Type", ctype)
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	_, _ = io.CopyBuffer(w, io.LimitReader(upResp.Body, 8<<20), make([]byte, 32<<10))
+	s.serveCover(w, r, firstOf(r.Form, "id"))
 }
 
 // Jukebox answers jukeboxControl probes with an empty stopped queue.
@@ -683,19 +657,21 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 		// safe to switch from a preview to the lossless file here.
 		if path, ok := s.storage.Lookup(id); ok {
 			log.Printf("stream: %q - %q: tier=cache", artist, title)
-			s.pin(r.RemoteAddr, id, variantFull)
+			s.pin(streamClient(r), id, variantFull)
 			s.serveCached(w, r, path)
 			return
 		}
 	} else {
 		// Mid-session Range (seek): keep serving the variant this playback
 		// began with so byte offsets remain valid.
-		switch s.pinnedVariant(r.RemoteAddr, id) {
+		switch s.pinnedVariant(streamClient(r), id) {
 		case variantFull:
 			if path, ok := s.storage.Lookup(id); ok {
 				s.serveCached(w, r, path)
 				return
 			}
+			writeRangeUnavailable(w)
+			return
 		case variantPreview:
 			if s.preview != nil {
 				if path, ok := s.preview.Lookup(id); ok {
@@ -703,10 +679,12 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			writeRangeUnavailable(w)
+			return
 		}
 		// Unknown/expired pin: best available (a rare offset reset).
 		if path, ok := s.storage.Lookup(id); ok {
-			s.pin(r.RemoteAddr, id, variantFull)
+			s.pin(streamClient(r), id, variantFull)
 			s.serveCached(w, r, path)
 			return
 		}
@@ -716,7 +694,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	if s.preview != nil {
 		if path, ok := s.preview.Lookup(id); ok {
 			log.Printf("stream: %q - %q: tier=preview-cache", artist, title)
-			s.pin(r.RemoteAddr, id, variantPreview)
+			s.pin(streamClient(r), id, variantPreview)
 			s.serveCached(w, r, path)
 			go s.startFullFetch(id, artist, album, title)
 			return
@@ -729,7 +707,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 		// abandoned) skips yt-dlp entirely.
 		if st, ok := s.cachedPreviewURL(id); ok {
 			log.Printf("stream: %q - %q: tier=youtube preview (recent url)", artist, title)
-			s.pin(r.RemoteAddr, id, variantPreview)
+			s.pin(streamClient(r), id, variantPreview)
 			s.servePreview(w, r, id, st)
 			go s.startFullFetch(id, artist, album, title)
 			return
@@ -747,7 +725,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 			}
 			s.previewFlight.finish(id)
 			if rerr == nil {
-				s.pin(r.RemoteAddr, id, variantPreview)
+				s.pin(streamClient(r), id, variantPreview)
 				if r.Context().Err() != nil {
 					log.Printf("stream: %q - %q: client left during resolve; caching preview for the retry", artist, title)
 					go s.cachePreview(id, st)
@@ -764,7 +742,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 			// Another request is already resolving this track; reuse it
 			// instead of starting a duplicate yt-dlp run.
 			log.Printf("stream: %q - %q: tier=youtube preview (coalesced)", artist, title)
-			s.pin(r.RemoteAddr, id, variantPreview)
+			s.pin(streamClient(r), id, variantPreview)
 			s.servePreview(w, r, id, st)
 			go s.startFullFetch(id, artist, album, title)
 			return
@@ -777,7 +755,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 			log.Printf("stream: %q - %q: soulseek failed: %v", artist, title, serr)
 		} else {
 			log.Printf("stream: %q - %q: tier=soulseek", artist, title)
-			s.pin(r.RemoteAddr, id, variantFull)
+			s.pin(streamClient(r), id, variantFull)
 			s.serveSoulseek(w, r, id, path)
 			return
 		}
@@ -790,12 +768,17 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 // Range/seek semantics. On a full (200) response it also spills the bytes to a
 // temp file and commits them to the preview cache, so replays start instantly.
 func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string, st ytaudio.Stream) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, st.URL, nil)
+	method := http.MethodGet
+	if r.Method == http.MethodHead {
+		method = http.MethodHead
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, st.URL, nil)
 	if err != nil {
 		writeFail(w, r, 0, "Stream unavailable")
 		return
 	}
-	if rng := r.Header.Get("Range"); rng != "" {
+	rng := r.Header.Get("Range")
+	if rng != "" {
 		req.Header.Set("Range", rng)
 	}
 	req.Header.Set("User-Agent", "MusicStreamer/1.0")
@@ -806,6 +789,13 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string,
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		if cr := resp.Header.Get("Content-Range"); cr != "" {
+			w.Header().Set("Content-Range", cr)
+		}
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		writeFail(w, r, 0, "Stream unavailable")
 		return
@@ -818,6 +808,24 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string,
 	if ctype == "" || strings.HasPrefix(ctype, "text/") {
 		ctype = "audio/mp4"
 	}
+
+	// The upstream ignored a mid-stream Range and returned the whole file. We
+	// must never relay a 200 for a non-zero offset: players reject it and the
+	// seek dies. Cache the full preview, then let ServeContent answer the range.
+	if resp.StatusCode == http.StatusOK && rng != "" && !rangeIsFresh(r) {
+		if method == http.MethodHead {
+			writeRangeUnavailable(w)
+			return
+		}
+		path, ok := s.storePreviewBody(id, resp.Body)
+		if !ok {
+			writeRangeUnavailable(w)
+			return
+		}
+		s.serveCached(w, r, path)
+		return
+	}
+
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Accept-Ranges", "bytes")
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
@@ -827,6 +835,9 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string,
 		w.Header().Set("Content-Range", cr)
 	}
 	w.WriteHeader(resp.StatusCode)
+	if method == http.MethodHead {
+		return
+	}
 
 	// Range request (seek): pure proxy, never cache a partial file.
 	if resp.StatusCode == http.StatusPartialContent || s.preview == nil {
@@ -836,23 +847,63 @@ func (s *Server) servePreview(w http.ResponseWriter, r *http.Request, id string,
 
 	// Full GET: stream to the client while spilling to a temp file; commit to
 	// the preview cache only on a clean EOF (no partial files).
-	tmp, err := os.CreateTemp(s.preview.Dir(), id+".*.tmp")
-	if err != nil {
-		_, _ = io.CopyBuffer(w, resp.Body, make([]byte, 32<<10))
+	if _, ok := s.storePreviewTee(id, w, resp.Body); !ok {
 		return
 	}
+}
+
+// storePreviewBody drains a full upstream response into the preview cache.
+func (s *Server) storePreviewBody(id string, body io.Reader) (string, bool) {
+	if s.preview == nil {
+		return "", false
+	}
+	if _, ok := s.storePreviewTee(id, nil, body); !ok {
+		return "", false
+	}
+	return s.preview.Lookup(id)
+}
+
+// storePreviewTee spools body to a temp file, optionally echoing it to dst, and
+// commits it only after a clean EOF.
+func (s *Server) storePreviewTee(id string, dst io.Writer, body io.Reader) (string, bool) {
+	if s.preview == nil {
+		return "", false
+	}
+	tmp, err := os.CreateTemp(s.preview.Dir(), id+".*.tmp")
+	if err != nil {
+		if dst != nil {
+			_, _ = io.CopyBuffer(dst, body, make([]byte, 32<<10))
+		}
+		return "", false
+	}
 	tmpPath := tmp.Name()
-	tee := io.TeeReader(resp.Body, tmp)
-	_, copyErr := io.CopyBuffer(w, tee, make([]byte, 32<<10))
+	var src io.Reader = body
+	if dst != nil {
+		src = io.TeeReader(body, tmp)
+	}
+	var copyErr error
+	if dst != nil {
+		_, copyErr = io.CopyBuffer(dst, src, make([]byte, 32<<10))
+	} else {
+		_, copyErr = io.CopyBuffer(tmp, src, make([]byte, 32<<10))
+	}
 	syncErr := tmp.Sync()
 	closeErr := tmp.Close()
 	if copyErr != nil || syncErr != nil || closeErr != nil {
 		_ = os.Remove(tmpPath)
-		return
+		return "", false
 	}
 	if err := s.preview.CommitTemp(id, tmpPath); err != nil {
 		log.Printf("stream: preview cache store %s: %v", id, err)
+		return "", false
 	}
+	path, ok := s.preview.Lookup(id)
+	return path, ok
+}
+
+func writeRangeUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "5")
+	http.Error(w, "Range unavailable", http.StatusServiceUnavailable)
 }
 
 // cachePreview downloads a resolved preview URL in full and commits it to the
@@ -1013,6 +1064,7 @@ func (s *Server) startFullFetch(id, artist, album, title string) {
 			log.Printf("fetch: %q - %q: youtube resolve failed: %v", artist, title, err)
 			return
 		}
+		s.rememberThumbnail(id, st.ThumbnailURL)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, st.URL, nil)
 		if err != nil {
 			return

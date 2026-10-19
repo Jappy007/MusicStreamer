@@ -2,6 +2,8 @@ package subsonic
 
 import (
 	"context"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -68,6 +70,7 @@ func (s *Server) rememberPreviewURL(id string, st ytaudio.Stream) {
 	}
 	s.previewURLs[id] = previewURL{st: st, exp: now.Add(previewURLTTL)}
 	delete(s.previewFail, id)
+	s.rememberThumbnail(id, st.ThumbnailURL)
 }
 
 // previewFailTTL is how long a failed lookup suppresses retries, so repeated
@@ -144,20 +147,24 @@ const (
 	variantPreview
 )
 
-// pinTTL bounds how long a connection's variant is remembered, so the map
-// cannot grow without bound across long-lived keep-alive connections.
-const pinTTL = 30 * time.Minute
+// pinTTL bounds how long a client's variant is remembered, so the map cannot
+// grow without bound. Pins slide on every seek, covering long albums/sessions.
+const pinTTL = 6 * time.Hour
 
 type pinEntry struct {
-	id      string
 	variant int
 	at      time.Time
 }
 
-// pin records which file variant a connection is playing for id, so later
-// Range (seek) requests for the same track stay on the same file and keep
-// their byte offsets valid.
-func (s *Server) pin(remoteAddr, id string, variant int) {
+func pinKey(client, id string) string {
+	return client + "\x00" + id
+}
+
+// pin records which file variant a client is playing for id, so later Range
+// (seek) requests for the same track stay on the same file and keep their byte
+// offsets valid. Client identity deliberately excludes the source port, since
+// players open a new TCP connection for almost every seek.
+func (s *Server) pin(client, id string, variant int) {
 	s.pinMu.Lock()
 	if s.pins == nil {
 		s.pins = make(map[string]pinEntry)
@@ -168,18 +175,42 @@ func (s *Server) pin(remoteAddr, id string, variant int) {
 			delete(s.pins, k)
 		}
 	}
-	s.pins[remoteAddr] = pinEntry{id: id, variant: variant, at: now}
+	s.pins[pinKey(client, id)] = pinEntry{variant: variant, at: now}
 	s.pinMu.Unlock()
 }
 
-// pinnedVariant returns the variant a connection is pinned to for id, or
-// variantNone if unknown.
-func (s *Server) pinnedVariant(remoteAddr, id string) int {
+// pinnedVariant returns the variant a client is pinned to for id, or
+// variantNone if unknown. A hit refreshes the sliding expiry.
+func (s *Server) pinnedVariant(client, id string) int {
 	s.pinMu.Lock()
 	defer s.pinMu.Unlock()
-	e, ok := s.pins[remoteAddr]
-	if !ok || e.id != id {
+	k := pinKey(client, id)
+	e, ok := s.pins[k]
+	if !ok {
 		return variantNone
 	}
+	if time.Since(e.at) > pinTTL {
+		delete(s.pins, k)
+		return variantNone
+	}
+	e.at = time.Now()
+	s.pins[k] = e
 	return e.variant
+}
+
+// streamClient identifies a playback client independently of its ephemeral TCP
+// source port. Psysonic (like most players) reconnects for each seek.
+func streamClient(r *http.Request) string {
+	u := ""
+	if name, _, ok := r.BasicAuth(); ok {
+		u = name
+	}
+	if u == "" && r.Form != nil {
+		u = firstOf(r.Form, "u")
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	return u + "\x00" + r.UserAgent() + "\x00" + host
 }

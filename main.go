@@ -124,6 +124,14 @@ func main() {
 	}
 	go cache.StartCleaner(preview, time.Minute, stopCleaner)
 
+	// Artwork cache: cover resolution is expensive and clients cache failures
+	// aggressively, so images are validated and stored once.
+	artwork, err := cache.New(filepath.Join(cfg.CacheDir, "artwork"), 512<<20)
+	if err != nil {
+		log.Fatalf("artwork cache init: %v", err)
+	}
+	go cache.StartCleaner(artwork, time.Minute, stopCleaner)
+
 	// Persistent user state (playlists, stars, ratings, play counts, queue).
 	// The JSON file lives beside the cache so no extra volume is required.
 	lib, err := library.New(cfg.StateDir)
@@ -182,7 +190,7 @@ func main() {
 	}
 
 	subsonic.ConfigureIdentity(cfg.ServerType, cfg.ServerVersion)
-	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, yt, store, preview, lib, nil)
+	srv := subsonic.NewServer(cfg.SubsonicUser, cfg.SubsonicPass, meta, sk, yt, store, preview, artwork, lib, nil)
 
 	mux := http.NewServeMux()
 	subsonic.Route(mux, srv)
